@@ -254,3 +254,61 @@ export const DISPOSITION = {
   PARSE_FAILED: 'fail-now',
   UNKNOWN: 'fail-now',
 } as const satisfies Record<FailureKind, Disposition>;
+
+/**
+ * 실패 목록(DLQ) 큐 이름. 워커(#13)가 최종 실패를 여기 한 건씩 넣는다.
+ *
+ * 원래 큐의 실패 목록(`failedReason`)만으로는 모자란 이유: 거기는 문자열 하나라 원본을
+ * 실을 자리가 없다. PARSE_FAILED·UNKNOWN의 대응은 원본을 남기는 것(`FIRST_REMEDY`의
+ * CAPTURE_RAW)이고, 사람이 코드를 고치려면 원본이 있어야 한다. 원래 큐의 실패는 그대로
+ * 두고(API가 상태를 거기서 읽는다) 같은 내용과 원본을 이 큐에 한 번 더 남긴다.
+ *
+ * 이 큐를 꺼내는 워커는 없다. 항목은 대기 상태로 쌓이고 사람이 읽는다. 작업 ID는 원래
+ * 작업 ID와 같다. 같은 작업이 두 번 실패 처리를 지나도(DLQ에 넣은 뒤 던지기 전에 워커가
+ * 죽는 경우) 항목이 하나만 남는다.
+ */
+export function deadLetterQueueName(queueName: string): string {
+  return `${queueName}-dead`;
+}
+
+/**
+ * 원본 응답을 DLQ에 싣는 모양. 본문은 base64다. 대상 서버 본문은 EUC-KR이라 UTF-8
+ * 문자열로 바꾸면 되돌릴 수 없게 깨진다. 사람이 볼 때는 디코딩하는 한 단계가 늘지만,
+ * 파서를 고친 뒤 같은 바이트를 다시 넣어 볼 수 있다.
+ */
+export type CapturedRaw =
+  | { status: number; headers: Record<string, string | string[] | undefined>; bodyBase64: string }
+  | { network: { code?: string; name?: string; message: string } };
+
+export type DeadLetterData = {
+  originalId: string;
+  /** null이면 분류하지 못한 실패다. 자격증명 없음 같은 설정 오류가 여기로 온다. */
+  kind: FailureKind | null;
+  detail: string;
+  /** 이번 시도를 포함한 시도 수. 원래 작업이 failed로 간 뒤의 `attemptsMade`와 같다. */
+  attemptsMade: number;
+  /** ISO 8601 UTC. */
+  failedAt: string;
+  /** 작업 데이터 그대로다. 작업 데이터에는 비밀이 없다(위 `CollectionJobData`). */
+  request: CollectionJobData;
+  /** PARSE_FAILED·UNKNOWN에만 있다. **`redactForCapture`를 거친 값**이다. */
+  raw: CapturedRaw | null;
+};
+
+/**
+ * AUTH_FAILED 차단기 키. 값이 있으면 그 로그인 ID의 작업은 로그인을 보내지 않고 바로
+ * 실패한다. 워커가 쓰고, 지우는 것은 사람이다(`redis-cli DEL`).
+ *
+ * 작업 하나가 AUTH_FAILED를 받으면 그 작업은 다시 돌지 않는다(`DISPOSITION`). 그런데 같은
+ * 로그인 ID의 **다른** 작업(기간이 다른 요청)은 저마다 로그인을 한 번씩 보내고, 대상
+ * 서버는 비밀번호 오류 5회에 계정을 잠근다. 작업 하나만 보는 층(`credentials.ts`)은 이것을
+ * 막을 수 없어서 작업을 가로질러 보는 이 키가 필요하다.
+ *
+ * 만료를 두지 않는다. 비밀번호가 틀린 것은 시간이 지나도 풀리지 않고, 만료로 풀면 풀릴
+ * 때마다 한 번씩 틀린 비밀번호가 나가 결국 계정이 잠긴다. 자격증명을 고친 사람이 지운다.
+ *
+ * 큐 이름을 넣은 이유는 결과 키와 같다. 테스트 큐의 차단이 운영 큐를 막지 않게 한다.
+ */
+export function authBlockKey(queueName: string, loginId: string): string {
+  return `authblock:${queueName}:${loginId}`;
+}
