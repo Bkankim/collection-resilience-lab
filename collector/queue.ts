@@ -81,12 +81,18 @@ export const COLLECT_JOB_OPTIONS = {
 } as const;
 
 /**
- * 작업 ID. 계좌와 **정규화한** 기간의 해시다. 같은 계좌·기간이면 같은 ID가 나오고,
+ * 작업 ID. 로그인 ID, 계좌, **정규화한** 기간의 해시다. 같은 요청이면 같은 ID가 나오고,
  * BullMQ는 같은 ID의 작업을 새로 만들지 않는다. 이것이 멱등의 첫 겹이다. 두 번째 겹은
  * 결과 저장소가 seq를 필드로 쓰는 것이다(#13). 작업이 다시 돌아도 결과가 늘지 않는다.
  *
- * 로그인 ID는 넣지 않는다. 같은 계좌·기간을 다른 로그인으로 요청해도 같은 거래내역이라
- * 같은 작업으로 본다. 먼저 들어온 요청의 로그인 ID로 수집한다.
+ * **로그인 ID를 넣는다.** 처음에는 "같은 계좌·기간은 누가 요청해도 같은 거래내역"이라며
+ * 뺐는데(커밋 de69730), 대상 서버는 로그인 하나에 계좌 하나를 묶는다. 다른 로그인으로 그
+ * 계좌를 조회하면 403 ACCOUNT_MISMATCH이고 분류기는 UNKNOWN을 낸다. 로그인 ID를 빼면
+ * 두 가지가 생긴다(#12 리뷰에서 재현).
+ * - 권한 없는 로그인이 먼저 요청하면 그 계좌·기간의 작업이 실패로 남고, 실패 작업은
+ *   지우지도 다시 돌리지도 않으므로 계좌 주인의 요청도 영원히 그 실패를 받는다.
+ * - 계좌 주인이 먼저 요청해 완료되면 권한 없는 로그인이 같은 ID로 그 행을 받는다.
+ * 수집의 성공과 결과를 볼 자격이 로그인 ID에 달려 있으므로 ID도 거기에 달려야 한다.
  *
  * 정규화한 값을 쓰는 이유: `2026-09-01`과 `2026-09-01 00:00:00`은 같은 기간 시작인데
  * 문자열이 다르다. 원문을 해시하면 같은 요청이 두 작업이 된다.
@@ -96,10 +102,10 @@ export const COLLECT_JOB_OPTIONS = {
  * 우연히 숫자만으로 나오는 경우를 막으려고 `col_`을 앞에 붙인다. 128비트(32자)면 충돌은
  * 걱정할 크기가 아니다.
  */
-export function jobIdOf(accountNo: string, from: string, to: string): string {
+export function jobIdOf(loginId: string, accountNo: string, from: string, to: string): string {
   // 이어 붙이지 않고 배열로 직렬화한다. 이어 붙이면 경계가 모호해져 다른 입력이 같은
   // 문자열이 될 수 있다.
-  const digest = createHash('sha256').update(JSON.stringify([accountNo, from, to])).digest('hex');
+  const digest = createHash('sha256').update(JSON.stringify([loginId, accountNo, from, to])).digest('hex');
   return `col_${digest.slice(0, 32)}`;
 }
 
@@ -159,6 +165,9 @@ function normalizeBound(
  * 결과 저장소 키. Redis 해시 하나에 필드는 `seq`, 값은 `Transaction` JSON이다. 쓰는 쪽은
  * 워커(#13)다. seq를 필드로 두면 같은 페이지를 두 번 저장해도 행이 늘지 않는다.
  *
+ * **워커는 프로세서가 반환하기 전에 결과를 전부 쓴다.** API는 작업이 completed면 이 해시를
+ * 결과로 읽는다. 반환한 뒤에 쓰면 완료인데 행이 비었거나 모자란 응답이 나간다.
+ *
  * 큐 이름을 키에 넣었다. 같은 Redis를 쓰는 큐가 둘이면(테스트, 측정 시나리오) 같은
  * 계좌·기간이 같은 작업 ID를 내므로, ID만으로 키를 만들면 서로의 결과를 덮는다.
  */
@@ -202,3 +211,46 @@ export function parseFailedReason(reason: string | undefined): RecordedFailure {
   }
   return { kind: null, detail: text };
 }
+
+/**
+ * 실패 종류별 처분. 워커(#13)가 수집 실패를 받았을 때 BullMQ에 **무엇을 던지는가**.
+ *
+ * 이 표가 없으면 `COLLECT_JOB_OPTIONS.attempts`(3)와 `CONSUMES_ATTEMPT.AUTH_FAILED`(true)를
+ * 그대로 읽은 워커가 일반 Error를 던지고, AUTH_FAILED가 세 번 돌아 계정이 잠긴다(#12 리뷰
+ * 재현: 프로세서 3회). `CONSUMES_ATTEMPT`는 "시도 횟수를 깎는 실패인가"이지 "다시 해도
+ * 되는가"가 아니다. 다시 해도 되는지는 여기서 정한다.
+ *
+ * - `rate-limit`: `await queue.rateLimit(ms)` 뒤 `throw Worker.RateLimitError()`. 시도 횟수를
+ *   깎지 않는다. **Worker 옵션에 `limiter: { max, duration }`이 필수다.** 없으면 부른 워커만
+ *   쉬고 같은 큐의 다른 워커는 제한 창 안에서 계속 꺼낸다. `worker.rateLimit()`은 6.3.8에서
+ *   deprecated라 `queue.rateLimit()`을 쓴다. **`maxStartedAttempts`는 켜지 않는다.** 속도
+ *   제한으로 되돌아갈 때마다 `attemptsStarted`가 올라 그 상한에서 작업이 실패한다
+ *   (셋 다 `docs/evidence/d2-bullmq-spike.md`).
+ * - `retry`: 일반 Error. `attempts`만큼 백오프하며 다시 한다. 시도 횟수를 깎는다.
+ * - `fail-now`: `UnrecoverableError`. 남은 시도와 상관없이 한 번에 failed로 가고(스파이크 5번),
+ *   실패 목록이 곧 DLQ다. 메시지는 `formatFailedReason` 모양이어야 `failedReason`에서 읽힌다.
+ *
+ * 종류별 근거:
+ * - RATE_LIMITED: 큐 전체를 멈춘다(`FIRST_REMEDY` PAUSE_QUEUE).
+ * - IP_BLOCKED: 대응은 출발지 전환인데 D2에는 출발지가 하나뿐이다. 같은 출발지로 기다려도
+ *   풀리지 않으므로 마지막 분류를 남기고 끝낸다. 전환은 #14에서 이 칸을 바꾼다.
+ * - SESSION_EXPIRED: 정상 흐름에서는 밖으로 나오지 않는다. `collect` 안에서 재인증하고 그
+ *   페이지를 한 번 다시 보내며, 재인증 직후 또 세션 실패면 UNKNOWN으로 올려 내보낸다
+ *   (`session.ts` `#fetchPage`·`#login`). 다만 1차 인증(`/login`) 응답이 세션 실패로
+ *   분류되면 올리지 않고 그대로 나온다. 그때는 재인증을 또 해 봐야 같은 자리에서 막히므로
+ *   `fail-now`로 둔다. `retry`로 두면 시도 횟수를 깎지 않는다는 약속과도 어긋난다.
+ * - TRANSIENT: 잠시 뒤 다시 하면 된다.
+ * - AUTH_FAILED: 다시 하면 계정이 잠긴다.
+ * - PARSE_FAILED·UNKNOWN: 코드를 고쳐야 풀린다. 원본을 남기고 사람에게 넘긴다.
+ */
+export type Disposition = 'rate-limit' | 'retry' | 'fail-now';
+
+export const DISPOSITION = {
+  RATE_LIMITED: 'rate-limit',
+  IP_BLOCKED: 'fail-now',
+  SESSION_EXPIRED: 'fail-now',
+  AUTH_FAILED: 'fail-now',
+  TRANSIENT: 'retry',
+  PARSE_FAILED: 'fail-now',
+  UNKNOWN: 'fail-now',
+} as const satisfies Record<FailureKind, Disposition>;

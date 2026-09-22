@@ -2,27 +2,34 @@ import { describe, expect, it } from 'vitest';
 
 import { collect } from './client/session.js';
 import type { Transport } from './client/transport.js';
-import { FAILURE_KINDS } from './client/errors.js';
-import { formatFailedReason, jobIdOf, normalizePeriod, parseFailedReason, resultsKey } from './queue.js';
+import { CONSUMES_ATTEMPT, FAILURE_KINDS, FIRST_REMEDY } from './client/errors.js';
+import { DISPOSITION, formatFailedReason, jobIdOf, normalizePeriod, parseFailedReason, resultsKey } from './queue.js';
 import { redisUrlForTests } from './redis-for-tests.js';
 
 describe('jobIdOf', () => {
-  it('같은 계좌·기간이면 같은 ID이고, BullMQ가 받는 모양이다', () => {
-    const a = jobIdOf('000-11-222333', '2026-09-01 00:00:00', '2026-09-30 23:59:59');
-    expect(a).toBe(jobIdOf('000-11-222333', '2026-09-01 00:00:00', '2026-09-30 23:59:59'));
+  const FROM = '2026-09-01 00:00:00';
+  const TO = '2026-09-30 23:59:59';
+
+  it('같은 로그인·계좌·기간이면 같은 ID이고, BullMQ가 받는 모양이다', () => {
+    const a = jobIdOf('demo01', '000-11-222333', FROM, TO);
+    expect(a).toBe(jobIdOf('demo01', '000-11-222333', FROM, TO));
     // 정수로 읽히면 BullMQ가 거부하고, ':'도 거부한다. 접두사가 둘 다 막는다.
     expect(a).toMatch(/^col_[0-9a-f]{32}$/);
   });
 
-  it('계좌·시작·끝 중 하나라도 다르면 다른 ID다', () => {
-    const base = jobIdOf('000-11-222333', '2026-09-01 00:00:00', '2026-09-30 23:59:59');
-    expect(jobIdOf('000-11-222334', '2026-09-01 00:00:00', '2026-09-30 23:59:59')).not.toBe(base);
-    expect(jobIdOf('000-11-222333', '2026-09-02 00:00:00', '2026-09-30 23:59:59')).not.toBe(base);
-    expect(jobIdOf('000-11-222333', '2026-09-01 00:00:00', '2026-09-29 23:59:59')).not.toBe(base);
+  it('로그인·계좌·시작·끝 중 하나라도 다르면 다른 ID다', () => {
+    const base = jobIdOf('demo01', '000-11-222333', FROM, TO);
+    // 대상 서버는 로그인 하나에 계좌 하나를 묶는다. 다른 로그인의 요청이 같은 작업이 되면
+    // 실패가 계좌 주인에게 옮고, 결과가 권한 없는 로그인에게 샌다.
+    expect(jobIdOf('demo02', '000-11-222333', FROM, TO)).not.toBe(base);
+    expect(jobIdOf('demo01', '000-11-222334', FROM, TO)).not.toBe(base);
+    expect(jobIdOf('demo01', '000-11-222333', '2026-09-02 00:00:00', TO)).not.toBe(base);
+    expect(jobIdOf('demo01', '000-11-222333', FROM, '2026-09-29 23:59:59')).not.toBe(base);
   });
 
   it('경계를 옮겨 이어 붙이면 같아지는 입력도 다른 ID다', () => {
-    expect(jobIdOf('1', '23', '4')).not.toBe(jobIdOf('12', '3', '4'));
+    expect(jobIdOf('a', '1', '23', '4')).not.toBe(jobIdOf('a', '12', '3', '4'));
+    expect(jobIdOf('a1', '2', '3', '4')).not.toBe(jobIdOf('a', '12', '3', '4'));
   });
 });
 
@@ -100,6 +107,36 @@ describe('실패 기록 형식', () => {
       detail: '자격증명을 찾을 수 없다: demo09',
     });
     expect(parseFailedReason(undefined)).toEqual({ kind: null, detail: '' });
+  });
+});
+
+describe('DISPOSITION', () => {
+  it('시도 횟수를 깎지 않는 종류는 retry가 아니다', () => {
+    // retry는 일반 Error라 attempts를 깎는다. CONSUMES_ATTEMPT가 false인데 retry면 약속이 깨진다.
+    for (const kind of FAILURE_KINDS) {
+      if (!CONSUMES_ATTEMPT[kind]) expect(DISPOSITION[kind], kind).not.toBe('retry');
+    }
+  });
+
+  it('retry인 종류는 시도 횟수를 깎는 종류다', () => {
+    for (const kind of FAILURE_KINDS) {
+      if (DISPOSITION[kind] === 'retry') expect(CONSUMES_ATTEMPT[kind], kind).toBe(true);
+    }
+  });
+
+  it('대응에 DEAD_LETTER가 있는 종류는 fail-now다', () => {
+    // AUTH_FAILED를 retry로 두면 attempts: 3만큼 비밀번호를 보내 계정이 잠긴다.
+    for (const kind of FAILURE_KINDS) {
+      if ((FIRST_REMEDY[kind] as readonly string[]).includes('DEAD_LETTER')) expect(DISPOSITION[kind], kind).toBe('fail-now');
+    }
+    expect(DISPOSITION.AUTH_FAILED).toBe('fail-now');
+  });
+
+  it('큐를 멈추는 종류만 rate-limit이다', () => {
+    for (const kind of FAILURE_KINDS) {
+      const pauses = (FIRST_REMEDY[kind] as readonly string[]).includes('PAUSE_QUEUE');
+      expect(DISPOSITION[kind] === 'rate-limit', kind).toBe(pauses);
+    }
   });
 });
 

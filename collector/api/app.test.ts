@@ -22,10 +22,13 @@ import { createRedis, formatFailedReason, resultsKey } from '../queue.js';
 import type { CollectionJobData } from '../queue.js';
 import { redisUrlForTests } from '../redis-for-tests.js';
 import { buildApi, parseRequest, toStatus } from './app.js';
+import type { BuildApiOptions } from './app.js';
 
 const REDIS_URL = redisUrlForTests();
 
 const BODY = { loginId: 'demo01', accountNo: '000-11-222333', from: '2026-09-01', to: '2026-09-30' };
+/** 테스트의 "지금". BODY의 기간이 끝난 뒤다. 실제 시계를 쓰면 날짜가 지나며 결과가 바뀐다. */
+const NOW = Date.UTC(2026, 9, 15, 0, 0, 0);
 
 type Lab = {
   app: FastifyInstance;
@@ -41,11 +44,11 @@ afterEach(async () => {
   for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
 });
 
-async function makeLab(): Promise<Lab> {
+async function makeLab(extra: Partial<BuildApiOptions> = {}): Promise<Lab> {
   const url = REDIS_URL as string;
   const redis = createRedis('producer', url);
   const queue = new Queue<CollectionJobData>(`test-collections-${randomUUID()}`, { connection: redis });
-  const app = buildApi({ queue, redis });
+  const app = buildApi({ queue, redis, clock: () => NOW, ...extra });
   const workers: Worker[] = [];
   const workerConnections: Redis[] = [];
   cleanups.push(async () => {
@@ -99,6 +102,10 @@ async function waitForStatus(app: FastifyInstance, id: string, status: string, t
   }
 }
 
+async function totalJobs(queue: Queue): Promise<number> {
+  return Object.values(await queue.getJobCounts()).reduce((a, b) => a + b, 0);
+}
+
 function row(seq: number): Transaction {
   return { seq, at: `2026-09-0${seq} 10:00:00`, memo: `거래${seq}`, withdrawal: 0, deposit: 1000, balance: 1000 * seq };
 }
@@ -128,8 +135,22 @@ describe('parseRequest', () => {
     ['달력에 없는 날', { ...BODY, from: '2026-02-30' }],
     ['from > to', { ...BODY, from: '2026-10-01' }],
     ['비밀 필드', { ...BODY, password: 'demo-pass-01' }],
+    ['하이픈 연속', { ...BODY, accountNo: '0--------1' }],
+    ['하이픈으로 시작', { ...BODY, accountNo: '-000-11-222333' }],
+    ['하이픈으로 끝남', { ...BODY, accountNo: '000-11-222333-' }],
+    ['하이픈 없음', { ...BODY, accountNo: '00011222333' }],
+    ['32자 초과', { ...BODY, accountNo: `${'1'.repeat(30)}-123` }],
+    ['끝나지 않은 기간(날짜만)', { ...BODY, to: '2026-10-15' }],
+    ['끝나지 않은 기간(시각)', { ...BODY, to: '2026-10-15 00:00:01' }],
   ])('%s면 거절한다', (_label, body) => {
-    expect(parseRequest(typeof body === 'string' ? JSON.parse(body) : body).ok).toBe(false);
+    expect(parseRequest(typeof body === 'string' ? JSON.parse(body) : body, NOW).ok).toBe(false);
+  });
+
+  it('지금까지 끝난 기간과 여러 묶음 계좌는 받는다', () => {
+    expect(parseRequest({ ...BODY, to: '2026-10-14' }, NOW).ok).toBe(true);
+    expect(parseRequest({ ...BODY, to: '2026-10-15 00:00:00' }, NOW).ok).toBe(true);
+    expect(parseRequest({ ...BODY, accountNo: '1-2' }, NOW).ok).toBe(true);
+    expect(parseRequest({ ...BODY, accountNo: '123-456-789-0123' }, NOW).ok).toBe(true);
   });
 });
 
@@ -155,22 +176,60 @@ describe.skipIf(REDIS_URL === undefined)('수집 요청 API (Redis)', () => {
     });
   });
 
-  it('같은 계좌·기간을 두 번 요청하면 같은 ID이고 큐에 작업은 하나다', async () => {
+  it('같은 로그인·계좌·기간을 두 번 요청하면 같은 ID이고 큐에 작업은 하나다', async () => {
     const { app, queue } = await makeLab();
     const first = (await post(app, BODY)).json();
-    // 같은 기간을 다른 표기로, 다른 로그인 ID로 보낸다. 계좌·기간이 같으면 같은 작업이다.
-    const second = await post(app, { ...BODY, loginId: 'demo02', from: '2026-09-01 00:00:00' });
+    // 같은 기간을 다른 표기로 보낸다. 정규화하면 같은 요청이다.
+    const second = await post(app, { ...BODY, from: '2026-09-01 00:00:00', to: '2026-09-30 23:59:59' });
 
     expect(second.statusCode).toBe(202);
     expect(second.json().id).toBe(first.id);
-    const counts = await queue.getJobCounts();
-    expect(Object.values(counts).reduce((a, b) => a + b, 0)).toBe(1);
-    // 먼저 들어온 요청이 남는다. add가 돌려주는 객체에는 두 번째 데이터가 실려 오지만
-    // 저장된 것은 바뀌지 않는다.
-    expect((await get(app, first.id)).json().request.loginId).toBe('demo01');
+    expect(await totalJobs(queue)).toBe(1);
 
-    const other = (await post(app, { ...BODY, to: '2026-09-29' })).json();
-    expect(other.id).not.toBe(first.id);
+    expect((await post(app, { ...BODY, to: '2026-09-29' })).json().id).not.toBe(first.id);
+    expect((await post(app, { ...BODY, loginId: 'demo02' })).json().id).not.toBe(first.id);
+  });
+
+  it('동시에 같은 요청 여럿이 와도 ID는 하나, 작업도 하나다', async () => {
+    const { app, queue } = await makeLab();
+    const responses = await Promise.all(
+      Array.from({ length: 20 }, (_, i) => post(app, i % 2 === 0 ? BODY : { ...BODY, from: '2026-09-01 00:00:00' })),
+    );
+    expect(new Set(responses.map((r) => r.statusCode))).toEqual(new Set([202]));
+    expect(new Set(responses.map((r) => r.json().id)).size).toBe(1);
+    expect(await totalJobs(queue)).toBe(1);
+  });
+
+  /**
+   * #12 리뷰 재현. 대상 서버는 로그인 하나에 계좌 하나를 묶는다. 작업 ID에 로그인 ID가 없으면
+   * 권한 없는 로그인(demo02)이 먼저 요청해 실패한 작업을 계좌 주인(demo01)도 받는다.
+   * 가짜 프로세서가 대상 서버처럼 로그인과 계좌를 묶는다.
+   */
+  it('다른 로그인의 실패가 계좌 주인의 요청으로 옮지 않고, 주인의 결과가 다른 로그인에게 새지 않는다', async () => {
+    const { app, queue, redis, startWorker } = await makeLab();
+    const owner: Record<string, string> = { demo01: '000-11-222333', demo02: '000-44-555666' };
+    startWorker(async (job) => {
+      if (owner[job.data.loginId] !== job.data.accountNo) {
+        throw new UnrecoverableError(formatFailedReason('UNKNOWN', 'HTTP 403 ACCOUNT_MISMATCH'));
+      }
+      const key = resultsKey(queue.name, job.id as string);
+      await redis.hset(key, '1', JSON.stringify(row(1)));
+      return { count: 1 };
+    });
+
+    const intruder = (await post(app, { ...BODY, loginId: 'demo02' })).json();
+    expect((await waitForStatus(app, intruder.id, 'failed')).json().failure.kind).toBe('UNKNOWN');
+
+    const ownerReq = (await post(app, BODY)).json();
+    expect(ownerReq.id).not.toBe(intruder.id);
+    const done = (await waitForStatus(app, ownerReq.id, 'completed')).json();
+    expect(done.request.loginId).toBe('demo01');
+    expect(done.result.count).toBe(1);
+
+    // 주인이 끝낸 뒤 다시 들어온 권한 없는 요청은 여전히 자기 실패 작업을 본다. 주인의 행이 없다.
+    const again = (await post(app, { ...BODY, loginId: 'demo02' })).json();
+    expect(again).toEqual({ id: intruder.id, status: 'failed' });
+    expect((await get(app, again.id)).json().result).toBeUndefined();
   });
 
   it('잘못된 본문은 400이고 큐에 아무것도 넣지 않는다', async () => {
@@ -180,8 +239,52 @@ describe.skipIf(REDIS_URL === undefined)('수집 요청 API (Redis)', () => {
       expect(res.statusCode).toBe(400);
       expect(res.json().error).toBe('BAD_REQUEST');
     }
-    const counts = await queue.getJobCounts();
-    expect(Object.values(counts).reduce((a, b) => a + b, 0)).toBe(0);
+    expect(await totalJobs(queue)).toBe(0);
+  });
+
+  it('POST에 쿼리스트링이 있으면 400이고, 요청 로그에 쿼리가 남지 않는다', async () => {
+    const lines: string[] = [];
+    const { app, queue } = await makeLab({ logger: { stream: { write: (line) => void lines.push(line) } } });
+    const res = await app.inject({ method: 'POST', url: '/collections?password=demo-pass-01', payload: BODY });
+
+    expect(res.statusCode).toBe(400);
+    expect(res.json().error).toBe('BAD_REQUEST');
+    expect(await totalJobs(queue)).toBe(0);
+    // 요청 로그는 핸들러보다 먼저 찍힌다. 로그가 실제로 찍혔는지 먼저 보고, 비밀이 없는지 본다.
+    expect(lines.some((l) => l.includes('"url":"/collections"'))).toBe(true);
+    expect(lines.join('')).not.toContain('demo-pass-01');
+    expect(lines.join('')).not.toContain('password');
+  });
+
+  it('거절 응답은 전부 { error, detail } 한 모양이다', async () => {
+    const { app } = await makeLab();
+    const cases = [
+      { res: await app.inject({ method: 'POST', url: '/collections', headers: { 'content-type': 'application/json' }, payload: '{"loginId":' }), status: 400, error: 'BAD_REQUEST' },
+      { res: await app.inject({ method: 'POST', url: '/collections', headers: { 'content-type': 'application/json' }, payload: '{"__proto__":{"x":1}}' }), status: 400, error: 'BAD_REQUEST' },
+      { res: await post(app, { ...BODY, pad: 'x'.repeat(2_000_000) }), status: 413, error: 'PAYLOAD_TOO_LARGE' },
+      { res: await app.inject({ method: 'POST', url: '/collections', headers: { 'content-type': 'application/xml' }, payload: '<a/>' }), status: 415, error: 'UNSUPPORTED_MEDIA_TYPE' },
+      { res: await app.inject({ method: 'GET', url: '/nowhere?password=x' }), status: 404, error: 'NOT_FOUND' },
+      { res: await post(app, { ...BODY, to: '2099-12-31' }), status: 400, error: 'BAD_REQUEST' },
+      { res: await get(app, 'col_' + '0'.repeat(32)), status: 404, error: 'NOT_FOUND' },
+      { res: await get(app, 'not-an-id'), status: 404, error: 'NOT_FOUND' },
+    ];
+    for (const { res, status, error } of cases) {
+      expect(res.statusCode, res.body).toBe(status);
+      const body = res.json();
+      expect(Object.keys(body).sort(), res.body).toEqual(['detail', 'error']);
+      expect(body.error).toBe(error);
+      expect(res.body).not.toContain('password');
+    }
+  });
+
+  it('5xx는 내부 메시지를 내보내지 않는다', async () => {
+    const { app, queue } = await makeLab();
+    queue.add = async () => {
+      throw new Error('ERR redis://secret-host:6379 스크립트 오류');
+    };
+    const res = await post(app, BODY);
+    expect(res.statusCode).toBe(500);
+    expect(res.json()).toEqual({ error: 'INTERNAL', detail: '내부 오류' });
   });
 
   it('상태가 대기 → 처리중 → 완료로 바뀌고, 완료면 결과를 seq 순으로 준다', async () => {
@@ -253,6 +356,46 @@ describe.skipIf(REDIS_URL === undefined)('수집 요청 API (Redis)', () => {
     expect((await post(app, BODY)).json()).toEqual({ id, status: 'failed' });
     await new Promise((r) => setTimeout(r, 300));
     expect(worker.calls()).toBe(1);
+  });
+
+  /**
+   * TROUBLESHOOTING 3번의 회귀 테스트. 상태를 처리중으로 읽은 뒤, 작업을 읽기 전에 작업을
+   * 실패시킨다. 상태를 먼저 읽는 지금 순서면 처리중으로 답한다. 작업을 먼저 읽는 옛 순서로
+   * 되돌리면 이 훅은 작업을 읽은 뒤에 불리므로 "실패인데 사유 없음"이 나와 매번 실패한다.
+   */
+  it('상태를 읽은 뒤 작업이 끝나도 사유 없는 실패를 주지 않는다', async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    let queueRef!: Queue<CollectionJobData>;
+    let armed = false;
+    const lab = await makeLab({
+      betweenReads: async (id) => {
+        if (!armed) return;
+        armed = false;
+        release();
+        const deadline = Date.now() + 5000;
+        while ((await queueRef.getJobState(id)) !== 'failed') {
+          if (Date.now() > deadline) throw new Error('작업이 실패하지 않았다');
+          await new Promise((r) => setTimeout(r, 10));
+        }
+      },
+    });
+    queueRef = lab.queue;
+    lab.startWorker(async () => {
+      await gate;
+      throw new UnrecoverableError(formatFailedReason('AUTH_FAILED', 'HTTP 401 + X-Auth-Failed'));
+    });
+    const { id } = (await post(lab.app, BODY)).json();
+    await waitForStatus(lab.app, id, 'running');
+
+    armed = true;
+    const view = (await get(lab.app, id)).json();
+    expect(view.status).toBe('running');
+    expect(view.failure).toBeUndefined();
+
+    const failed = (await get(lab.app, id)).json();
+    expect(failed.status).toBe('failed');
+    expect(failed.failure).toEqual({ kind: 'AUTH_FAILED', detail: 'HTTP 401 + X-Auth-Failed' });
   });
 
   it('없는 ID는 404다. 이 API가 만들지 않는 모양의 ID는 큐에 묻지도 않는다', async () => {
