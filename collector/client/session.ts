@@ -94,7 +94,9 @@ export class CollectorSession {
       body: JSON.stringify({ id: this.#credentials.loginId, password: this.#credentials.password }),
     });
     const firstFailure = this.#authStep(first, (body) => body.next === 'otp', '1차 인증');
-    if (firstFailure !== undefined) return firstFailure;
+    // 단계를 싣는다. 워커가 1차 인증의 UNKNOWN을 자격증명 문제일 수 있는 실패로 보고
+    // 로그인 ID 단위로 막는 데 쓴다(`classify.ts` `AuthStage`).
+    if (firstFailure !== undefined) return { ...firstFailure, authStage: 'login' };
 
     // otplib의 epoch은 **초** 단위다. 밀리초를 넘겨도 예외 없이 틀린 코드가 나온다
     // (target/accounts.ts의 같은 주석 참고).
@@ -111,9 +113,9 @@ export class CollectorSession {
       // 막힌다(세션 수명이 로그인 흐름보다 짧거나, 1차 쿠키를 못 들고 있거나). 재인증으로
       // 돌리면 무한 루프라 흐름 버그로 올린다.
       if (secondFailure.kind === 'SESSION_EXPIRED') {
-        return promoteToUnknown(second, secondFailure, '1차 인증 직후 2차 인증에서 세션 실패');
+        return { ...promoteToUnknown(second, secondFailure, '1차 인증 직후 2차 인증에서 세션 실패'), authStage: 'otp' };
       }
-      return secondFailure;
+      return { ...secondFailure, authStage: 'otp' };
     }
 
     this.#authenticated = true;

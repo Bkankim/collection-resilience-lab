@@ -30,6 +30,7 @@ import type { Transaction } from '../client/parse.js';
 import { collect } from '../client/session.js';
 import type { CollectResult } from '../client/session.js';
 import { createUndiciTransport } from '../client/transport.js';
+import type { Transport } from '../client/transport.js';
 import {
   COLLECT_JOB,
   COLLECT_JOB_OPTIONS,
@@ -335,23 +336,176 @@ suite('큐 워커: retry·fail-now 처분과 DLQ', () => {
     expect(res.status).toBe(200);
   });
 
-  it('IP_BLOCKED는 D2에서 전환할 출발지가 없어 한 번에 DLQ로 간다', { timeout: TIMEOUT }, async () => {
+  it('IP_BLOCKED는 D2에서 Retry-After만큼 큐를 멈추고, 차단 중 대기 작업을 실패시키지 않고 풀린 뒤 끝낸다', { timeout: TIMEOUT }, async () => {
     const target = await startTarget();
-    // 창 안에 2개까지, 초과 1회에 바로 차단. 로그인 2개가 통과하고 1페이지가 403 IP_BLOCKED다.
+    // 창 안에 4개(demo02 작업 하나)까지, 초과 1회에 바로 1초 차단. 두 번째 작업의 로그인이 403
+    // IP_BLOCKED(Retry-After 1)를 받고, 차단이 풀리면 대상 서버가 카운터를 비우므로 들어간다.
     await target.configure({
       switches: { rateLimit: true, ipBlock: true },
-      thresholds: { windowSec: 10, maxRequests: 2, blockAfter: 1 },
+      thresholds: { windowSec: 10, maxRequests: 4, blockAfter: 1, blockDurationSec: 1 },
     });
     const lab = await makeLab();
     await lab.startWorker('w1', realCollect(target.origin));
-    const id = await lab.add(DEMO02, at(0), at(24));
-    expect(await lab.waitFinished([id])).toEqual({ [id]: 'failed' });
+    const ids = [await lab.add(DEMO02, at(0), at(24)), await lab.add(DEMO02, at(0), at(48)), await lab.add(DEMO02, at(0), at(72))];
+    const states = await lab.waitFinished(ids);
+    // fail-now였을 때는 1초 차단 동안 뒤의 두 작업이 영구 failed가 됐다(리뷰 r3).
+    expect(Object.values(states)).toEqual(['completed', 'completed', 'completed']);
 
+    const blocked = lab.events.filter((e) => e.event === 'rate-limited');
+    expect(blocked.length).toBeGreaterThanOrEqual(2);
+    expect(blocked.every((e) => e.event === 'rate-limited' && e.kind === 'IP_BLOCKED' && e.attemptsMade === 0 && e.waitMs === 1000)).toBe(true);
+    expect(target.hits.filter((h) => h.status === 403)).toHaveLength(blocked.length);
+    expect(await lab.deadLetter.count()).toBe(0);
+    for (const id of ids) expect((await lab.queue.getJob(id))?.attemptsMade).toBe(1);
+  });
+
+  it('BullMQ가 프로세서 없이 실패시킨 작업(멈춤 한도 초과)도 DLQ에 kind null로 남는다', { timeout: TIMEOUT }, async () => {
+    const lab = await makeLab();
+    let calls = 0;
+    const id = await lab.add(DEMO02, at(0), at(24));
+    // 처리 중 워커가 두 번 죽으면 BullMQ(6.3.8 moveStalledJobsToWait)가 작업 해시에 이 필드를
+    // 남기고 대기로 돌린다. 워커 두 번을 실제로 죽이는 대신 그 결과를 직접 만든다. 그 뒤의 경로
+    // (다음 워커가 프로세서 없이 실패시키고 failed 이벤트만 내는 것)는 BullMQ 그대로다. 실제로
+    // 죽이는 경로는 증거 문서(d2-pipeline.md 4절, 리뷰 r4)에 있다.
+    await lab.redis.hset(`bull:${lab.queue.name}:${id}`, 'defa', 'job stalled more than allowable limit');
+    await lab.startWorker('w1', async () => {
+      calls += 1;
+      return { ok: true, rows: [], pages: 1 };
+    });
+    expect(await lab.waitFinished([id])).toEqual({ [id]: 'failed' });
+    await waitUntil(() => lab.events.some((e) => e.event === 'dead-letter'));
+
+    expect(calls).toBe(0);
+    const dead = (await lab.deadLetter.getJob(id))?.data;
+    expect(dead?.kind).toBeNull();
+    expect(dead?.detail).toContain('job stalled more than allowable limit');
+    expect(dead?.request).toEqual((await lab.queue.getJob(id))?.data);
+  });
+
+  it('fail-now에서 DLQ 쓰기가 한 번 실패해도 다시 수집하지 않고, failed 이벤트에서 DLQ를 마저 쓴다', { timeout: TIMEOUT }, async () => {
+    const lab = await makeLab();
+    const realAdd = lab.deadLetter.add.bind(lab.deadLetter);
+    let adds = 0;
+    lab.deadLetter.add = (async (...args: Parameters<typeof realAdd>) => {
+      adds += 1;
+      if (adds === 1) throw new Error("READONLY You can't write against a read only replica.");
+      return realAdd(...args);
+    }) as typeof lab.deadLetter.add;
+    let calls = 0;
+    await lab.startWorker('w1', async () => {
+      calls += 1;
+      return { ok: false, kind: 'UNKNOWN', detail: '1차 인증 2xx 본문이 예상과 다르다', raw: { status: 200, headers: {}, body: Buffer.from('{}') } };
+    });
+    const id = await lab.add(DEMO02, at(0), at(24), { backoff: { type: 'fixed', delay: 20 } });
+    expect(await lab.waitFinished([id])).toEqual({ [id]: 'failed' });
+    await waitUntil(() => lab.events.some((e) => e.event === 'dead-letter'));
+
+    // 예전에는 쓰기 오류가 일반 오류로 나가 BullMQ가 다시 돌렸다(collect 2회, 리뷰 r5).
+    expect(calls).toBe(1);
+    expect((await lab.queue.getJob(id))?.attemptsMade).toBe(1);
+    expect(lab.events.map((e) => e.event)).toEqual(['dead-letter-error', 'dead-letter']);
+    expect((await lab.deadLetter.getJob(id))?.data).toMatchObject({ kind: 'UNKNOWN', attemptsMade: 1 });
+  });
+
+  it('차단기 기록이 실패해도 AUTH_FAILED 작업은 재시도하지 않아 비밀번호가 다시 나가지 않는다', { timeout: TIMEOUT }, async () => {
+    const target = await startTarget();
+    const lab = await makeLab();
+    const redis = lab.redis;
+    // 차단기 SET만 실패시키는 연결. 나머지 명령은 진짜 연결로 보낸다.
+    const flaky = new Proxy(redis, {
+      get(obj, prop) {
+        if (prop === 'set') return async () => { throw new Error('READONLY'); };
+        const value = Reflect.get(obj, prop, obj) as unknown;
+        return typeof value === 'function' ? (value as (...a: unknown[]) => unknown).bind(obj) : value;
+      },
+    });
+    const connection = createRedis('worker', REDIS_URL as string);
+    const worker = createCollectionWorker({
+      connection,
+      deps: {
+        collect: realCollect(target.origin, { COLLECTOR_DEMO01_PASSWORD: 'changed-elsewhere' }),
+        redis: flaky,
+        queue: lab.queue,
+        deadLetter: lab.deadLetter,
+        clock: systemClock,
+        log: (event) => lab.events.push({ ...event, worker: 'w1', t: Date.now() }),
+      },
+    });
+    cleanups.push(async () => {
+      await worker.close();
+      connection.disconnect();
+    });
+    const id = await lab.add(DEMO01, at(0), at(24), { backoff: { type: 'fixed', delay: 20 } });
+    expect(await lab.waitFinished([id])).toEqual({ [id]: 'failed' });
+    await sleep(200);
+
+    expect(target.hits.filter((h) => h.path === '/login')).toHaveLength(1);
     const job = await lab.queue.getJob(id);
     expect(job?.attemptsMade).toBe(1);
-    expect(parseFailedReason(job?.failedReason).kind).toBe('IP_BLOCKED');
-    expect((await lab.deadLetter.getJob(id))?.data).toMatchObject({ kind: 'IP_BLOCKED', attemptsMade: 1 });
-    expect(target.hits.map((h) => h.status)).toEqual([200, 200, 403]);
+    expect(parseFailedReason(job?.failedReason).kind).toBe('AUTH_FAILED');
+    expect(job?.failedReason).toContain('차단기 기록 실패');
+    expect(lab.events.some((e) => e.event === 'auth-block-error')).toBe(true);
+    expect(await redis.get(authBlockKey(lab.queue.name, 'demo01'))).toBeNull();
+  });
+
+  it('1차 인증의 UNKNOWN(모르는 423)도 차단기를 걸고, 인증 단계의 TRANSIENT는 걸지 않는다', { timeout: TIMEOUT }, async () => {
+    const lab = await makeLab();
+    const logins: string[] = [];
+    // 로그인 ID별로 다른 응답을 주는 가짜 전송. demo01은 423(분류기가 모르는 상태 코드),
+    // demo02는 연결 리셋(TRANSIENT).
+    const transportFor = (loginId: string): Transport => async (req) => {
+      if (req.path === '/login') {
+        logins.push(loginId);
+        if (loginId === 'demo01') return { status: 423, headers: {}, body: Buffer.from('{"error":"LOCKED_BY_POLICY"}') };
+        return { network: { code: 'ECONNRESET', message: 'socket hang up' } };
+      }
+      return { status: 500, headers: {}, body: Buffer.from('') };
+    };
+    await lab.startWorker('w1', (data) =>
+      collect({ transport: transportFor(data.loginId), clock: systemClock }, data.loginId, data.accountNo, data.from, data.to),
+    );
+    const unknownIds: string[] = [];
+    for (let day = 0; day < 3; day += 1) unknownIds.push(await lab.add(DEMO01, at(day * 24), at(day * 24 + 23)));
+    const transientId = await lab.add(DEMO02, at(0), at(24), { backoff: { type: 'fixed', delay: 20 } });
+    const states = await lab.waitFinished([...unknownIds, transientId]);
+    expect(Object.values(states)).toEqual(['failed', 'failed', 'failed', 'failed']);
+
+    // demo01: 로그인 1번, 뒤의 두 작업은 차단기에 막혔다. 차단 사유 종류는 UNKNOWN이다.
+    expect(logins.filter((l) => l === 'demo01')).toHaveLength(1);
+    const block = JSON.parse((await lab.redis.get(authBlockKey(lab.queue.name, 'demo01'))) as string) as { kind: string };
+    expect(block.kind).toBe('UNKNOWN');
+    const dead = await Promise.all(unknownIds.map(async (id) => (await lab.deadLetter.getJob(id))?.data));
+    expect(dead.map((d) => d?.kind)).toEqual(['UNKNOWN', 'UNKNOWN', 'UNKNOWN']);
+    expect(dead.filter((d) => d?.detail.startsWith('차단기:'))).toHaveLength(2);
+    // demo02: TRANSIENT는 환경 문제라 막지 않는다. attempts(3)만큼 로그인했다.
+    expect(logins.filter((l) => l === 'demo02')).toHaveLength(3);
+    expect(await lab.redis.get(authBlockKey(lab.queue.name, 'demo02'))).toBeNull();
+  });
+
+  it('사람이 실패 작업을 다시 돌려 또 실패하면 DLQ 항목을 새 내용으로 갱신한다', { timeout: TIMEOUT }, async () => {
+    const lab = await makeLab();
+    let calls = 0;
+    await lab.startWorker('w1', async () => {
+      calls += 1;
+      return { ok: false, kind: 'TRANSIENT', detail: `HTTP 503 (호출 ${calls})` };
+    });
+    const id = await lab.add(DEMO02, at(0), at(24), { backoff: { type: 'fixed', delay: 20 } });
+    await lab.waitFinished([id]);
+    const first = (await lab.deadLetter.getJob(id))?.data;
+    expect(first?.detail).toBe('HTTP 503 (호출 3)');
+
+    await sleep(20); // failedAt이 밀리초 단위라 같은 값이 나오지 않게 한다.
+    await (await lab.queue.getJob(id))?.retry('failed');
+    await waitUntil(() => lab.events.filter((e) => e.event === 'dead-letter').length === 2);
+    await lab.waitFinished([id]);
+
+    const second = (await lab.deadLetter.getJob(id))?.data;
+    expect(await lab.deadLetter.count()).toBe(1);
+    // bullmq 6.3.8의 retry()는 시도 수를 되돌리지 않는다. 다시 돈 첫 시도가 곧 마지막 시도다.
+    expect(calls).toBe(4);
+    expect(second?.detail).toBe('HTTP 503 (호출 4)');
+    expect(second?.attemptsMade).toBe(4);
+    expect(second?.failedAt).not.toBe(first?.failedAt);
   });
 
   it('DLQ에 남기는 원본에서 세션 토큰을 가린다', { timeout: TIMEOUT }, async () => {

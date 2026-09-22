@@ -289,6 +289,22 @@ describe('수집 세션: 기간과 전송', () => {
     expect(JSON.stringify(failure)).not.toContain('SECRET');
   });
 
+  it('인증 실패에는 난 단계(login·otp)를 싣고, 거래내역 실패에는 싣지 않는다', async () => {
+    // 워커가 1차 인증의 UNKNOWN을 자격증명 문제일 수 있는 실패로 보고 로그인 ID를 막는 데 쓴다.
+    const at = (fail: string): Transport => async (req) => {
+      if (req.path === fail) return { status: 423, headers: {}, body: Buffer.from('{}') };
+      if (req.path === '/login') return { status: 200, headers: {}, body: Buffer.from('{"next":"otp"}') };
+      if (req.path === '/auth/otp') return { status: 200, headers: {}, body: Buffer.from('{"level":"FULL"}') };
+      return { status: 423, headers: {}, body: Buffer.from('{}') };
+    };
+    const make = (fail: string) => new CollectorSession({ transport: at(fail), credentials: CREDS, clock: () => START_MS });
+    expect(await make('/login').collect(ACCOUNT.accountNo, '2026-01-01', '2026-01-02')).toMatchObject({ kind: 'UNKNOWN', authStage: 'login' });
+    expect(await make('/auth/otp').collect(ACCOUNT.accountNo, '2026-01-01', '2026-01-02')).toMatchObject({ kind: 'UNKNOWN', authStage: 'otp' });
+    const pageFailure = await make('/none').collect(ACCOUNT.accountNo, '2026-01-01', '2026-01-02');
+    expect(pageFailure).toMatchObject({ kind: 'UNKNOWN' });
+    expect(pageFailure).not.toHaveProperty('authStage');
+  });
+
   it('TOTP 공유키가 틀린 자격증명으로는 세션을 만들지 않고, 요청도 하나도 나가지 않는다', () => {
     const calls: string[] = [];
     const transport: Transport = async (req) => {

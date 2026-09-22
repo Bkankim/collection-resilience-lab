@@ -232,8 +232,15 @@ export function parseFailedReason(reason: string | undefined): RecordedFailure {
  *
  * 종류별 근거:
  * - RATE_LIMITED: 큐 전체를 멈춘다(`FIRST_REMEDY` PAUSE_QUEUE).
- * - IP_BLOCKED: 대응은 출발지 전환인데 D2에는 출발지가 하나뿐이다. 같은 출발지로 기다려도
- *   풀리지 않으므로 마지막 분류를 남기고 끝낸다. 전환은 #14에서 이 칸을 바꾼다.
+ * - IP_BLOCKED: 대응은 출발지 전환인데 D2에는 출발지가 하나뿐이다. **D2의 임시 처분으로
+ *   rate-limit을 쓴다.** 대상 서버 차단은 `blockDurationSec` 뒤 스스로 풀리고 Retry-After를
+ *   준다(`target/switches.ts`). 처음에는 "같은 출발지로 기다려도 풀리지 않는다"며 fail-now로
+ *   뒀는데 대상 서버와 사실이 달랐고, 일시 차단 2초 동안 대기 작업 5건이 전부 영구 failed가
+ *   됐다(#13 리뷰 r3 재현). 실패 작업은 지우지 않고 작업 ID가 같으면 새로 만들지 않으므로,
+ *   차단이 풀린 뒤 같은 요청을 다시 넣어도 failed로 남는다. 큐 전체를 Retry-After만큼 멈추면
+ *   시도 횟수를 깎지 않는다는 `CONSUMES_ATTEMPT.IP_BLOCKED`(false)와도 맞는다. 다만 차단이
+ *   풀리자마자 다시 막히면 속도 제한과 같은 끝나지 않는 반복이 된다(TROUBLESHOOTING 4번).
+ *   #14에서 출발지 전환(ROTATE_EGRESS)이 들어오면 이 칸이 바뀐다.
  * - SESSION_EXPIRED: 정상 흐름에서는 밖으로 나오지 않는다. `collect` 안에서 재인증하고 그
  *   페이지를 한 번 다시 보내며, 재인증 직후 또 세션 실패면 UNKNOWN으로 올려 내보낸다
  *   (`session.ts` `#fetchPage`·`#login`). 다만 1차 인증(`/login`) 응답이 세션 실패로
@@ -247,7 +254,7 @@ export type Disposition = 'rate-limit' | 'retry' | 'fail-now';
 
 export const DISPOSITION = {
   RATE_LIMITED: 'rate-limit',
-  IP_BLOCKED: 'fail-now',
+  IP_BLOCKED: 'rate-limit',
   SESSION_EXPIRED: 'fail-now',
   AUTH_FAILED: 'fail-now',
   TRANSIENT: 'retry',

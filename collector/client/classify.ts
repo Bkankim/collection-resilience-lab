@@ -42,6 +42,16 @@ export type ClassifyInput = RawResponse | NetworkFailure;
 /** 원본을 남겨야 하는 종류. `FIRST_REMEDY`에서 `CAPTURE_RAW`로 시작하는 두 종류와 같다. */
 export type CaptureKind = 'PARSE_FAILED' | 'UNKNOWN';
 
+/**
+ * 실패가 난 인증 단계. 분류기는 응답 하나만 보므로 채우지 않는다. 인증 흐름을 아는 세션 층
+ * (`session.ts` `#login`)이 붙인다. `login`은 비밀번호를 보낸 1차 인증, `otp`는 2차 인증이다.
+ * 거래내역 조회에서 난 실패에는 없다.
+ *
+ * 워커(#13)가 이것을 본다. 1차 인증에서 난 UNKNOWN(헤더 없는 401, 423 등)은 자격증명 거부일
+ * 수 있어서(`classify401` 주석) 같은 로그인 ID로 비밀번호를 더 보내지 않게 차단기를 건다.
+ */
+export type AuthStage = 'login' | 'otp';
+
 export type Failure =
   | {
       ok: false;
@@ -49,11 +59,13 @@ export type Failure =
       detail: string;
       /** RATE_LIMITED·IP_BLOCKED에는 항상 있다. TRANSIENT는 서버가 줬을 때만. */
       retryAfterSec?: number;
+      authStage?: AuthStage;
     }
   | {
       ok: false;
       kind: CaptureKind;
       detail: string;
+      authStage?: AuthStage;
       /**
        * 원본. 저장은 워커가 한다. 타입으로 필수로 둬서 원본 없는 UNKNOWN이
        * 컴파일되지 않게 했다. 원본 없이 사람에게 넘기면 사람이 볼 것이 없다.

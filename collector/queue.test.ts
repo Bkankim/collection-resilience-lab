@@ -132,11 +132,21 @@ describe('DISPOSITION', () => {
     expect(DISPOSITION.AUTH_FAILED).toBe('fail-now');
   });
 
-  it('큐를 멈추는 종류만 rate-limit이다', () => {
+  it('큐를 멈추는 종류는 rate-limit이다', () => {
     for (const kind of FAILURE_KINDS) {
-      const pauses = (FIRST_REMEDY[kind] as readonly string[]).includes('PAUSE_QUEUE');
-      expect(DISPOSITION[kind] === 'rate-limit', kind).toBe(pauses);
+      if ((FIRST_REMEDY[kind] as readonly string[]).includes('PAUSE_QUEUE')) expect(DISPOSITION[kind], kind).toBe('rate-limit');
     }
+  });
+
+  it('PAUSE_QUEUE가 없는데 rate-limit인 것은 IP_BLOCKED뿐이다(D2 임시 처분)', () => {
+    // IP_BLOCKED의 대응은 출발지 전환(#14)이다. D2에는 출발지가 하나라 대상 서버가 주는
+    // Retry-After만큼 큐를 멈춘다. fail-now로 두면 일시 차단 동안 대기 작업이 전부 영구
+    // failed가 된다(#13 리뷰 r3). 다른 종류가 슬그머니 이 예외에 들어오지 않게 고정한다.
+    const extra = FAILURE_KINDS.filter(
+      (kind) => DISPOSITION[kind] === 'rate-limit' && !(FIRST_REMEDY[kind] as readonly string[]).includes('PAUSE_QUEUE'),
+    );
+    expect(extra).toEqual(['IP_BLOCKED']);
+    expect(CONSUMES_ATTEMPT.IP_BLOCKED).toBe(false);
   });
 });
 
