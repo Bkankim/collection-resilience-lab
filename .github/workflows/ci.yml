@@ -8,10 +8,12 @@ on:
 jobs:
   check:
     # 고객사 설치 환경이 제각각이라는 가정으로 여러 런타임 버전을 함께 검증한다.
+    # "22"는 최신 22.x로 풀리므로 선언한 하한(engines, undici 8이 요구하는 22.19.0)을
+    # 검증하지 못한다. 하한을 따로 고정해 둬야 선언이 실제로 검증된다.
     strategy:
       fail-fast: false
       matrix:
-        node: ["22", "24", "26"]
+        node: ["22.19.0", "22", "24", "26"]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7

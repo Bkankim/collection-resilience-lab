@@ -5,7 +5,7 @@
   "type": "module",
   "description": "수집 안정화 실험실 - 차단하는 서버와 수집 워커를 함께 만들어 차단에서 회복까지를 측정합니다",
   "engines": {
-    "node": ">=22"
+    "node": ">=22.19.0"
   },
   "packageManager": "pnpm@11.15.1",
   "scripts": {
