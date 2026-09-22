@@ -15,6 +15,20 @@ jobs:
       matrix:
         node: ["22.19.0", "22", "24", "26"]
     runs-on: ubuntu-latest
+    # 수집 요청 API 테스트가 실제 Redis에 붙는다(멱등이 BullMQ의 Redis 스크립트에 기댄다).
+    # REDIS_URL이 빠지면 그 테스트는 CI에서 건너뛰지 않고 실패한다(collector/redis-for-tests.ts).
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+    env:
+      REDIS_URL: redis://127.0.0.1:6379
     steps:
       - uses: actions/checkout@v7
       - uses: pnpm/action-setup@v6
