@@ -12,11 +12,12 @@
 
 import { generateSync } from 'otplib';
 
+import { redactFailure } from './capture.js';
 import { classify } from './classify.js';
 import type { Classification, ClassifyInput, Failure, RawResponse } from './classify.js';
 import type { Clock } from './clock.js';
 import { CookieJar } from './cookies.js';
-import { lookupCredentials } from './credentials.js';
+import { assertTotpSecret, lookupCredentials } from './credentials.js';
 import type { Credentials } from './credentials.js';
 import type { Transaction } from './parse.js';
 import type { HttpRequest, Transport } from './transport.js';
@@ -52,7 +53,9 @@ export class CollectorSession {
   #authenticated = false;
   readonly #stats: SessionStats = { logins: 0, reauths: 0, requests: 0 };
 
+  /** TOTP 공유키가 틀리면 던진다. 요청을 하나도 보내기 전에 설정 오류를 드러낸다. */
   constructor(options: SessionOptions) {
+    assertTotpSecret(options.credentials.loginId, options.credentials.totpSecret);
     this.#transport = options.transport;
     this.#credentials = options.credentials;
     this.#clock = options.clock;
@@ -75,6 +78,11 @@ export class CollectorSession {
    * 어려워진다.
    */
   async login(): Promise<Failure | undefined> {
+    const failure = await this.#login();
+    return failure === undefined ? undefined : redactFailure(failure);
+  }
+
+  async #login(): Promise<Failure | undefined> {
     this.#stats.logins += 1;
     this.#authenticated = false;
     this.#jar.clear();
@@ -120,27 +128,33 @@ export class CollectorSession {
    * 저장·전송)이 틀렸다는 뜻이고, 다시 해도 같은 결과다.
    */
   async fetchPage(accountNo: string, page: number): Promise<Classification> {
+    const { result } = await this.#fetchPage(accountNo, page);
+    return result.ok ? result : redactFailure(result);
+  }
+
+  /** 원본까지 돌려준다. `collect`가 페이지 검증에 실패했을 때 원본을 실으려고 쓴다. */
+  async #fetchPage(accountNo: string, page: number): Promise<{ input?: ClassifyInput; result: Classification }> {
     let fresh = false;
     if (!this.#authenticated) {
-      const failure = await this.login();
-      if (failure !== undefined) return failure;
+      const failure = await this.#login();
+      if (failure !== undefined) return { result: failure };
       fresh = true;
     }
 
     const path = `/transactions?account=${encodeURIComponent(accountNo)}&page=${page}`;
     const first = await this.#get(path);
-    if (!isSessionFailure(first.result)) return first.result;
-    if (fresh) return promoteToUnknown(first.input, first.result, '로그인 직후 첫 요청이 세션 실패');
+    if (!isSessionFailure(first.result)) return first;
+    if (fresh) return { result: promoteToUnknown(first.input, first.result, '로그인 직후 첫 요청이 세션 실패') };
 
     this.#stats.reauths += 1;
-    const failure = await this.login();
-    if (failure !== undefined) return failure;
+    const failure = await this.#login();
+    if (failure !== undefined) return { result: failure };
 
     const retry = await this.#get(path);
     if (isSessionFailure(retry.result)) {
-      return promoteToUnknown(retry.input, retry.result, '재인증 직후 첫 요청이 다시 세션 실패');
+      return { result: promoteToUnknown(retry.input, retry.result, '재인증 직후 첫 요청이 다시 세션 실패') };
     }
-    return retry.result;
+    return retry;
   }
 
   /**
@@ -148,20 +162,51 @@ export class CollectorSession {
    * 행만 남긴다. 날짜만 주면 `from`은 그날 00:00:00, `to`는 23:59:59로 읽는다.
    *
    * 끝을 `totalPages`가 아니라 빈 페이지로 판단한다. 분류기가 "행 0개 = 마지막 페이지
-   * 이후"를 요약 줄과 맞춰 검증하므로 빈 페이지가 곧 끝이라는 신호가 확실하고, 파서가
-   * 요약과 모순된 페이지를 PARSE_FAILED로 막으므로 끝나지 않는 루프도 없다.
+   * 이후"를 요약 줄과 맞춰 검증하므로 빈 페이지가 곧 끝이라는 신호가 확실하다.
+   *
+   * 다만 파서는 한 페이지 안의 일관성만 본다. 서버가 `?page=`를 무시하고 매번 1페이지를
+   * 주면 그 응답은 그 자체로 멀쩡해서 빈 페이지가 영영 오지 않는다. 그래서 루프가 두
+   * 가지를 더 본다. 받은 페이지가 **요청한 페이지·계좌인지**, 그리고 페이지 번호가
+   * 첫 페이지의 `totalPages + 1`을 넘지 않는지. 뒤의 것은 총 건수가 매 페이지 늘어나는
+   * 서버처럼 앞의 검사를 통과하면서도 끝나지 않는 경우를 막는 상한이다. 둘 다 흐름이나
+   * 서버 계약이 깨진 것이라 UNKNOWN과 원본으로 넘긴다.
    *
    * 실패하면 그 페이지의 분류 실패를 그대로 돌려준다. 대응은 워커(#13)가 FIRST_REMEDY로 한다.
    */
   async collect(accountNo: string, from: string, to: string): Promise<CollectResult> {
+    const result = await this.#collect(accountNo, from, to);
+    return result.ok ? result : redactFailure(result);
+  }
+
+  async #collect(accountNo: string, from: string, to: string): Promise<CollectResult> {
     const lower = normalizeBound(from, '00:00:00');
     const upper = normalizeBound(to, '23:59:59');
     const rows: Transaction[] = [];
+    let maxPage: number | undefined;
 
     for (let page = 1; ; page += 1) {
-      const result = await this.fetchPage(accountNo, page);
+      const { input, result } = await this.#fetchPage(accountNo, page);
       if (!result.ok) return result;
+      // 성공은 분류기를 거친 응답에서만 나오므로 input이 항상 있다.
+      const raw = input as ClassifyInput;
+      if (result.page.page !== page || result.page.accountNo !== accountNo) {
+        return {
+          ok: false,
+          kind: 'UNKNOWN',
+          detail: `요청과 다른 페이지를 받았다: 요청 ${accountNo} ${page}페이지, 응답 ${result.page.accountNo} ${result.page.page}페이지`,
+          raw,
+        };
+      }
+      maxPage ??= result.page.totalPages + 1;
       if (result.page.rows.length === 0) return { ok: true, rows, pages: page };
+      if (page >= maxPage) {
+        return {
+          ok: false,
+          kind: 'UNKNOWN',
+          detail: `첫 페이지의 totalPages + 1(${maxPage})페이지까지 빈 페이지가 오지 않았다`,
+          raw,
+        };
+      }
       // 거래일시 형식이 고정 길이 `YYYY-MM-DD HH:mm:ss`라 문자열 비교가 곧 시각 비교다.
       // 파서가 형식을 검증하므로 여기서 다시 보지 않는다.
       for (const row of result.page.rows) {

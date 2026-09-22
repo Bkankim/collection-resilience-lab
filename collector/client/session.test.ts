@@ -13,7 +13,8 @@ import { afterEach, describe, expect, it } from 'vitest';
 
 import { DEMO_ACCOUNTS } from '../../target/accounts.js';
 import { buildApp } from '../../target/app.js';
-import { buildLedger } from '../../target/transactions.js';
+import { TRANSACTIONS_CONTENT_TYPE, buildLedger, encodeEucKr, renderTransactionsHtml, selectPage } from '../../target/transactions.js';
+import { REDACTED } from './capture.js';
 import type { ClassifyInput, RawResponse } from './classify.js';
 import { CookieJar } from './cookies.js';
 import { lookupCredentials } from './credentials.js';
@@ -260,7 +261,13 @@ describe('수집 세션: 기간과 전송', () => {
     const session = new CollectorSession({ transport, credentials: CREDS, clock: () => START_MS });
     const result = await session.fetchPage(ACCOUNT.accountNo, 1);
 
-    expect(result).toMatchObject({ ok: false, kind: 'UNKNOWN', raw: redirect, detail: expect.stringContaining('302') });
+    // 원본은 싣되 세션 식별자는 가린다(capture.ts). 위치와 상태 코드는 그대로다.
+    expect(result).toMatchObject({
+      ok: false,
+      kind: 'UNKNOWN',
+      raw: { status: 302, headers: { location: '/login', 'set-cookie': [`lab_session=${REDACTED}; Path=/; Max-Age=1800`] } },
+      detail: expect.stringContaining('302'),
+    });
     expect(session.jar.headerFor('/transactions')).toBe('lab_session=from-302');
     expect(calls).toEqual(['POST /login', 'POST /auth/otp', `GET /transactions?account=${ACCOUNT.accountNo}&page=1`]);
   });
@@ -269,5 +276,70 @@ describe('수집 세션: 기간과 전송', () => {
     const transport = createUndiciTransport({ origin: 'http://127.0.0.1:1' });
     const session = new CollectorSession({ transport, credentials: CREDS, clock: () => START_MS });
     expect(await session.fetchPage(ACCOUNT.accountNo, 1)).toMatchObject({ ok: false, kind: 'TRANSIENT' });
+  });
+
+  it('인증 2xx 본문이 예상과 달라 UNKNOWN이 되면 원본의 세션 식별자를 가린다', async () => {
+    const transport: Transport = async (req) =>
+      req.path === '/login'
+        ? { status: 200, headers: { 'set-cookie': 'lab_session=PRIMARY-SECRET; Path=/' }, body: Buffer.from('{"next":"otp"}') }
+        : { status: 200, headers: { 'set-cookie': 'lab_session=FULL-SECRET-ID; Path=/' }, body: Buffer.from('{"level":"full"}') };
+    const session = new CollectorSession({ transport, credentials: CREDS, clock: () => START_MS });
+    const failure = await session.login();
+    expect(failure).toMatchObject({ kind: 'UNKNOWN', raw: { headers: { 'set-cookie': `lab_session=${REDACTED}; Path=/` } } });
+    expect(JSON.stringify(failure)).not.toContain('SECRET');
+  });
+
+  it('TOTP 공유키가 틀린 자격증명으로는 세션을 만들지 않고, 요청도 하나도 나가지 않는다', () => {
+    const calls: string[] = [];
+    const transport: Transport = async (req) => {
+      calls.push(req.path);
+      return { status: 200, headers: {}, body: Buffer.from('{}') };
+    };
+    expect(() => new CollectorSession({ transport, credentials: { ...CREDS, totpSecret: 'SHORT' }, clock: () => START_MS })).toThrow(
+      RangeError,
+    );
+    expect(calls).toEqual([]);
+  });
+});
+
+describe('수집 세션: 끝나지 않는 페이지 넘김을 막는다', () => {
+  /** 인증은 통과시키고 거래내역은 `page`에 따라 만든 HTML을 주는 가짜 전송. */
+  function fakeServer(render: (page: number) => string) {
+    const pageRequests: number[] = [];
+    const transport: Transport = async (req) => {
+      if (req.path === '/login') return { status: 200, headers: {}, body: Buffer.from('{"next":"otp"}') };
+      if (req.path === '/auth/otp') return { status: 200, headers: {}, body: Buffer.from('{"level":"FULL"}') };
+      const page = Number(req.path.split('page=')[1]);
+      pageRequests.push(page);
+      if (pageRequests.length > 50) throw new Error('끝나지 않는다');
+      return { status: 200, headers: { 'content-type': TRANSACTIONS_CONTENT_TYPE }, body: encodeEucKr(render(page)) };
+    };
+    return { transport, pageRequests };
+  }
+
+  it('?page=를 무시하고 매번 1페이지를 주는 서버에는 2페이지에서 UNKNOWN으로 멈춘다', async () => {
+    // 1페이지 응답은 그 자체로 멀쩡해서 파서를 통과한다. 빈 페이지가 영영 오지 않는다.
+    const { transport, pageRequests } = fakeServer(() => renderTransactionsHtml(selectPage(ACCOUNT.accountNo, ACCOUNT.txCount, 1)));
+    const session = new CollectorSession({ transport, credentials: CREDS, clock: () => START_MS });
+    const result = await session.collect(ACCOUNT.accountNo, '2026-01-01', '2026-12-31');
+    expect(result).toMatchObject({ ok: false, kind: 'UNKNOWN', detail: expect.stringContaining('요청 000-11-222333 2페이지, 응답 000-11-222333 1페이지') });
+    expect(result).toHaveProperty('raw.status', 200);
+    expect(pageRequests).toEqual([1, 2]);
+  });
+
+  it('다른 계좌의 페이지를 주면 UNKNOWN이다', async () => {
+    const { transport } = fakeServer((page) => renderTransactionsHtml(selectPage(DEMO_ACCOUNTS[1]!.accountNo, 12, page)));
+    const session = new CollectorSession({ transport, credentials: CREDS, clock: () => START_MS });
+    const result = await session.collect(ACCOUNT.accountNo, '2026-01-01', '2026-12-31');
+    expect(result).toMatchObject({ kind: 'UNKNOWN', detail: expect.stringContaining('000-44-555666') });
+  });
+
+  it('총 건수가 페이지마다 늘어 빈 페이지가 안 오면 첫 totalPages + 1에서 멈춘다', async () => {
+    // 매 페이지가 요청한 번호이고 요약과도 맞아서 앞의 검사를 모두 통과한다.
+    const { transport, pageRequests } = fakeServer((page) => renderTransactionsHtml(selectPage(ACCOUNT.accountNo, (page + 1) * 20, page)));
+    const session = new CollectorSession({ transport, credentials: CREDS, clock: () => START_MS });
+    const result = await session.collect(ACCOUNT.accountNo, '2026-01-01', '2026-12-31');
+    expect(result).toMatchObject({ kind: 'UNKNOWN', detail: expect.stringContaining('totalPages + 1(3)') });
+    expect(pageRequests).toEqual([1, 2, 3]);
   });
 });
