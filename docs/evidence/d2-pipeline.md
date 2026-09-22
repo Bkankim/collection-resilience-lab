@@ -246,8 +246,92 @@ $ curl -s localhost:8090/collections/col_f278a63e53ef0de894ae4b7dd1bb3b64
 매 주기 로그인 2 + 3페이지까지 받고 4페이지에서 429, 제한이 풀리면 다시 로그인부터입니다.
 `attemptsMade` 0으로 영원히 `queued`입니다. 받은 페이지를 이어 가지 않는 한(작업 안에서 페이지
 진행을 남기거나 페이지 단위로 쪼개기) 풀리지 않습니다. 이 기록은 한계로 남기고 고치지 않았습니다.
-또 3-2의 limiter(11초)가 아니라 10초 간격으로 다시 출발했습니다. `queue.rateLimit`이 limiter와
-같은 키의 수명을 덮어쓰기 때문으로 보이며, 확인하지 않았습니다.
+또 3-2의 limiter(11초)가 아니라 10초 간격으로 다시 출발했습니다. **`queue.rateLimit`이 limiter와
+같은 키를 조건 없이 덮어쓰기 때문입니다**(#13 리뷰로 확정, 4-4절). bullmq 6.3.8
+`redis-queue-backend.js`의 `setRateLimit`은 `SET bull:<큐>:limiter MAX_SAFE_INTEGER PX <ms>` 한 줄이고,
+limiter가 창을 세는 키도 같은 `bull:<큐>:limiter`입니다. 그래서 429가 한 번 나면 그 주기는 limiter
+창이 아니라 Retry-After 간격이 됩니다.
+
+## 4. #13 리뷰 재현 스크립트 재실행(수정 뒤)
+
+빈 컨텍스트 리뷰가 만든 재현 스크립트(r2~r5)를 수정 뒤 리포 루트에서 `pnpm -s tsx <경로>`로 다시
+돌렸습니다. 스크립트는 리포 밖(검수자 작업 디렉터리)에 있어서 여기에는 출력과, 제가 바꾼 변형의
+차이만 남깁니다. 끝나고 `review13` 키 0개, Redis 연결은 redis-cli 자신 1개였습니다.
+
+### 4-1. r3: IP_BLOCKED가 대기 작업을 영구 failed로 비우던 것
+
+수정 전(리뷰 기록): 2초 차단 동안 demo02 대기 5건이 전부 `failed`·DLQ 5건, 차단이 풀린 뒤 같은
+요청을 다시 넣어도 작업 ID가 같아 `failed`로 남았습니다. 수정 뒤 IP_BLOCKED는 Retry-After만큼 큐
+전체를 멈춥니다(`queue.ts` DISPOSITION).
+
+```
+$ pnpm -s tsx review13/r3-ipblock-drains-queue.mts      # 원본: 창 10초에 2요청, 초과 1회에 2초 차단
+{"phase":"during-block","elapsedMs":11465,"states":"timeout","kinds":[null,null,null,null,null],"dlq":0,"targetHits":["/login 200","/auth/otp 200","/transactions 403","/login 200","/auth/otp 200","/transactions 403", ...(같은 세 줄 반복)]}
+{"phase":"after-unblock-readd","health":200,"loginStatus":403,"states":["waiting","waiting","waiting","waiting","waiting"]}
+$ pnpm -s tsx review13-mine/r3b-ipblock-maxreq4.mts     # 변형: maxRequests 2 -> 4, 대기 한도 10초 -> 20초
+{"phase":"during-block","elapsedMs":8115,"states":["completed","completed","completed","completed","completed"],"kinds":[null,null,null,null,null],"dlq":0,"targetHits":["/login 200","/auth/otp 200","/transactions 200","/transactions 200","/login 403","/login 200","/auth/otp 200","/transactions 200","/transactions 200","/login 403", ...]}
+{"phase":"after-unblock-readd","health":200,"loginStatus":403,"states":["completed","completed","completed","completed","completed"]}
+```
+
+- 원본 조건에서는 더 이상 failed도 DLQ도 없습니다(대기 5건은 `waiting`). 그러나 작업 하나가 요청 4개인데
+  창이 2개라, 차단이 풀리면 로그인 2개 뒤 1페이지에서 다시 막히기를 되풀이하며 끝나지 않습니다.
+  3-3절과 같은 범주(창보다 큰 작업)입니다(TROUBLESHOOTING 4번).
+- 작업 하나가 창에 들어가는 변형(N=4)에서는 차단 한 번(2초)에 한 건씩, 5건이 8.1초에 전부 완료됐습니다.
+  DLQ 0건입니다. 마지막 줄의 `loginStatus` 403은 스크립트가 5번째 작업 직후 보낸 확인용 로그인이 다시
+  차단을 부른 것입니다.
+
+### 4-2. r4: 처리 중 워커가 두 번 죽은 작업이 DLQ에 남지 않던 것
+
+```
+$ pnpm -s tsx review13/r4-stalled-no-dlq.mts            # 원본: 자식 워커가 createProcessor로 Worker를 직접 만든다
+[C] FAILED col_s job stalled more than allowable limit
+{"state":"failed","failedReason":"job stalled more than allowable limit","parsed":{"kind":null,"detail":"job stalled more than allowable limit"},"attemptsMade":1,"dlqCount":0}
+$ pnpm -s tsx review13-mine/r4b-stalled-dlq.mts         # 변형: 자식 워커를 createCollectionWorker로 만든다(lockDuration 1초, stalledInterval 0.5초)
+[A] COLLECT_CALLED
+[A] SIGKILL while processing; state=active
+[B] COLLECT_CALLED
+[B] SIGKILL while processing; state=active
+[C] FAILED col_s job stalled more than allowable limit
+[C] {"event":"dead-letter","jobId":"col_s","attemptsMade":1,"kind":null,"detail":"BullMQ가 프로세서 밖에서 실패시켰다: job stalled more than allowable limit"}
+{"state":"failed","failedReason":"job stalled more than allowable limit","parsed":{"kind":null,"detail":"job stalled more than allowable limit"},"attemptsMade":1,"dlqCount":1,"dlq":{"originalId":"col_s","kind":null,"detail":"BullMQ가 프로세서 밖에서 실패시켰다: job stalled more than allowable limit","attemptsMade":1,"failedAt":"2026-09-22T22:46:19.506Z","request":{"loginId":"demo02","accountNo":"a","from":"f","to":"t"},"raw":null}}
+```
+
+이 실패는 프로세서를 거치지 않으므로(BullMQ가 `defa` 필드를 보고 `failed` 이벤트만 낸다) DLQ는
+Worker의 `failed` 이벤트에서 씁니다. 그 처리기는 `createCollectionWorker`가 붙입니다. 원본 r4의 자식은
+`createProcessor`로 Worker를 직접 만들어 처리기가 없으므로 수정 뒤에도 DLQ 0건이 맞고, 진입점
+(`index.ts`)과 같은 조립을 쓰는 변형에서 DLQ 1건이 됐습니다.
+
+### 4-3. r5: fail-now에서 DLQ 쓰기 실패가 재수집을 부르던 것
+
+```
+$ pnpm -s tsx review13/r5-failnow-dlq-error.mts
+{"collectCalls":1,"attemptsMade":1,"failedReason":"UNKNOWN: 1차 인증 2xx 본문이 예상과 다르다","dlq":{"kind":"UNKNOWN","attemptsMade":1,"hasRaw":true},"events":["dead-letter-error:undefined:undefined","dead-letter:UNKNOWN:1"]}
+```
+
+수정 전(리뷰 기록)은 collect 2회였습니다. 이제 첫 DLQ 쓰기가 실패해도 처분(UnrecoverableError)대로
+끝나고(collect 1회, `attemptsMade` 1), 못 쓴 항목을 `failed` 이벤트에서 다시 써 DLQ에 원본까지 남았습니다.
+
+### 4-4. r2: queue.rateLimit이 limiter 창을 덮어쓴다(코드 변경 없음, 사실 확인)
+
+```
+$ pnpm -s tsx review13/r2-ratelimit-overwrites-limiter.mts   # limiter 1개/4초
+baseline: no 429 (limiter 1 job / 4000ms)
+{"retryAfterSec":null,"starts":[{"job":"A","t":15,"pttlAtStart":3998},{"job":"B","t":4017,"pttlAtStart":3998},{"job":"C","t":8020,"pttlAtStart":3997}]}
+A gets 429 with Retry-After 0.3s
+{"retryAfterSec":0.3,"starts":[{"job":"A","t":15,"pttlAtStart":3998},{"job":"A","t":322,"pttlAtStart":3997},{"job":"B","t":4325,"pttlAtStart":3997},{"job":"C","t":8326,"pttlAtStart":3999}]}
+A gets 429 with Retry-After 7s (longer than limiter window)
+{"retryAfterSec":7,"starts":[{"job":"A","t":11,"pttlAtStart":3999},{"job":"A","t":7015,"pttlAtStart":3998},{"job":"B","t":11018,"pttlAtStart":3997}]}
+```
+
+0.3초짜리 429 뒤 A는 limiter 창(4초)을 무시하고 0.3초 뒤 다시 출발했고, 7초짜리 뒤에는 7초 뒤에
+출발했습니다. 소스(bullmq 6.3.8 `redis-queue-backend.js` `setRateLimit`)는 `SET bull:<큐>:limiter
+MAX_SAFE_INTEGER PX <ms>`를 조건 없이 보냅니다. 3-3절의 10초 간격이 이것입니다.
+
+### 4-5. 1~3절 수치에 대한 영향
+
+IP_BLOCKED 처분 변경은 1·2절(200건, 재투입)에 영향이 없습니다. 그 구간에 출발지 차단 스위치는 꺼져
+있었고 대상 서버 응답은 1401건 전부 200이었습니다(1절 `statusCode` 집계). 3절도 `ipBlock: false`였습니다.
+다시 측정하지 않았습니다.
 
 ## 정리
 
