@@ -1,0 +1,6 @@
+packages:
+  - '.'
+
+# pnpm 11은 package.json의 pnpm 필드를 읽지 않고, 키도 onlyBuiltDependencies가 아닌 allowBuilds다.
+allowBuilds:
+  esbuild: true

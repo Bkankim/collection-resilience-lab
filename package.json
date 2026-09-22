@@ -1,0 +1,25 @@
+{
+  "name": "collection-resilience-lab",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "수집 안정화 실험실 - 차단하는 서버와 수집 워커를 함께 만들어 차단에서 회복까지를 측정합니다",
+  "engines": {
+    "node": ">=22"
+  },
+  "packageManager": "pnpm@11.15.1",
+  "scripts": {
+    "dev:target": "tsx watch target/server.ts",
+    "dev:api": "tsx watch collector/api/server.ts",
+    "dev:worker": "tsx watch collector/worker/index.ts",
+    "scenario": "tsx scripts/scenario.ts",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0",
+    "vitest": "^2.1.0"
+  }
+}

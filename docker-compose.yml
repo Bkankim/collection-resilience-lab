@@ -1,0 +1,22 @@
+# D1~D3에 걸쳐 채운다. 지금은 뼈대만 둔다.
+services:
+  target:
+    # 수집 대상 서버. 차단 스위치를 가진 쪽.
+    build:
+      context: .
+      dockerfile: target/Dockerfile
+    ports:
+      - "8080:8080"
+    environment:
+      PORT: 8080
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
