@@ -102,7 +102,27 @@ describe('거래내역 파서', () => {
   it('행 수가 페이지 크기를 넘으면 실패다', () => {
     const selected = selectPage(ACCOUNT.accountNo, ACCOUNT.txCount, 1);
     const html = renderTransactionsHtml({ ...selected, rows: buildLedger(ACCOUNT.accountNo, ACCOUNT.txCount).slice(0, 21) });
-    expect(parseTransactionsHtml(encodeEucKr(html)).ok).toBe(false);
+    expect(parseTransactionsHtml(encodeEucKr(html))).toMatchObject({
+      ok: false,
+      detail: expect.stringContaining('읽은 행 21, 요약으로 계산한 행 20'),
+    });
+  });
+
+  it('요약은 2페이지인데 행이 1페이지 것이면 실패다', () => {
+    // 행 수는 20으로 맞는다. 행 수만 보면 1페이지를 두 번 수집하고도 성공이 된다.
+    const page2 = selectPage(ACCOUNT.accountNo, ACCOUNT.txCount, 2);
+    const html = renderTransactionsHtml({ ...page2, rows: selectPage(ACCOUNT.accountNo, ACCOUNT.txCount, 1).rows });
+    expect(parseTransactionsHtml(encodeEucKr(html))).toMatchObject({
+      ok: false,
+      detail: 'seq가 페이지 자리와 맞지 않는다: 1번째 행 seq 1, 기대 21',
+    });
+  });
+
+  it('seq 20 자리에 seq 1이 중복되면 실패다', () => {
+    const page1 = selectPage(ACCOUNT.accountNo, ACCOUNT.txCount, 1);
+    const rows = [...page1.rows.slice(0, 19), page1.rows[0]!];
+    const html = renderTransactionsHtml({ ...page1, rows });
+    expect(parseTransactionsHtml(encodeEucKr(html))).toMatchObject({ ok: false, detail: 'seq 1이 두 번 나온다' });
   });
 
   it('data-seq 없는 행이 섞이면 건너뛰지 않고 실패한다', () => {

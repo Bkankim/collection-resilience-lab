@@ -77,7 +77,33 @@ export function parseTransactionsHtml(body: Buffer): ParseResult {
     };
   }
 
+  const seqCheck = checkSeqs(rows.value, (page - 1) * pageSize + 1);
+  if (!seqCheck.ok) return seqCheck;
+
   return { ok: true, page: { accountNo, page, pageSize, total, totalPages, rows: rows.value } };
+}
+
+/**
+ * 행의 seq가 이 페이지 자리에 맞게 이어지는지 본다.
+ *
+ * 행 수만 맞추면 "요약은 2페이지인데 행은 1페이지 것"이나 "한 행이 다른 행의 중복"이
+ * 그대로 성공이 된다. 둘 다 수집 건수는 맞는데 내용이 틀린 경우라 측정에서 안 보인다.
+ * 중복을 먼저 보는 이유는 실패 이유를 사람이 바로 읽게 하려는 것이다. 중복도 결국
+ * 연속 검사에 걸리지만 "seq 1 자리에 20을 기대"보다 "seq 1이 두 번"이 원인에 가깝다.
+ */
+function checkSeqs(rows: readonly Transaction[], firstSeq: number): Step<true> {
+  const seen = new Set<number>();
+  for (const row of rows) {
+    if (seen.has(row.seq)) return { ok: false, detail: `seq ${row.seq}이 두 번 나온다` };
+    seen.add(row.seq);
+  }
+  for (const [i, row] of rows.entries()) {
+    const expected = firstSeq + i;
+    if (row.seq !== expected) {
+      return { ok: false, detail: `seq가 페이지 자리와 맞지 않는다: ${i + 1}번째 행 seq ${row.seq}, 기대 ${expected}` };
+    }
+  }
+  return { ok: true, value: true };
 }
 
 type Summary = Omit<TransactionPage, 'rows'>;

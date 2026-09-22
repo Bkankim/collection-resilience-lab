@@ -150,9 +150,12 @@ $ pnpm -s tsx classify-captured.mts cap
 - **04와 05는 같은 403이고 둘 다 Retry-After가 없지만 판정이 다르다.** 04(2차 인증 전
   조회)는 우리 흐름이 틀린 것이라 UNKNOWN으로 원본을 남긴다. 05(코드 거부)는 30초
   경계에 걸린 코드가 대부분이라 다음 코드로 다시 하면 된다.
-- **03·06이 PARSE_FAILED인 것은 의도다.** `classify()`는 거래내역 응답을 위한 것이고,
-  로그인·2차 인증의 200 JSON은 세션 흐름(다음 이슈)이 직접 본다. 거래내역 자리에
-  JSON이 오면 구조가 바뀐 것이므로 PARSE_FAILED가 맞다.
+- **03·06은 계약 밖 입력이라 PARSE_FAILED가 나온다.** `classify()`의 적용 범위는
+  거래내역 응답(`GET /transactions`) 전부와, 인증 응답(`POST /login`, `POST /auth/otp`)
+  중 **2xx가 아닌 것**이다. 인증 2xx 본문의 해석과 쿠키 교체는 세션 흐름(#9)이 한다.
+  `classify()`는 200을 거래내역 화면으로만 읽으므로 인증 200을 넣으면 PARSE_FAILED가
+  된다. 여기서는 계약 밖에서 무엇이 나오는지 보이려고 일부러 넣었다. 01(`X-Auth-Failed`)과
+  05(`OTP_REJECTED`) 분기가 분류기에 있는 이유가 이 계약이다. 둘은 인증 응답에서만 온다.
 - 13의 `retryAfterSec=10`은 서버가 준 값이다. 기본값(`DEFAULT_RATE_LIMIT_WAIT_SEC`,
   역시 10)과 우연히 같으므로, 헤더를 읽었는지는 detail로 가린다. 헤더 없이 기본값을
   쓰면 detail에 "Retry-After 헤더 없음"이 붙는다(테스트로 고정).

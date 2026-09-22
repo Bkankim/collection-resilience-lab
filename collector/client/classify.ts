@@ -8,6 +8,12 @@
  * 매번 서버를 띄워야 한다. 상태 코드·헤더·본문 바이트만 받으면 실제로 받아 둔 바이트를
  * 그대로 넣어서 판정을 재현할 수 있다.
  *
+ * 적용 범위: 거래내역 응답(`GET /transactions`)은 전부 넣는다. 인증 응답(`POST /login`,
+ * `POST /auth/otp`)은 **2xx가 아닐 때만** 넣는다. 인증 2xx 본문(`{ next: 'otp' }`,
+ * `{ level: 'FULL' }`)의 해석과 쿠키 교체는 세션 흐름(#9)이 한다. 여기서 200은 거래내역
+ * 화면으로만 읽으므로, 인증 200을 넣으면 PARSE_FAILED가 나온다. 401 `X-Auth-Failed`와
+ * 403 `OTP_REJECTED` 분기가 있는 이유가 이 계약이다. 둘은 인증 응답에서만 온다.
+ *
  * 판정 원칙: **모르면 추측하지 않는다.** 애매한 응답을 그럴듯한 종류에 넣으면 그 종류의
  * 대응이 자동으로 돈다. UNKNOWN은 원본을 남기고 사람에게 넘기는 것이 대응이라, 틀려도
  * 비용이 가장 작다.
@@ -171,6 +177,14 @@ function classify401(input: RawResponse): Classification {
   }
   // 쿠키 없이 왔거나 폐기된 식별자로 왔을 때 대상 서버는 헤더 없이 `NO_SESSION`을 준다.
   // 세션이 없으니 인증부터 하면 되고, 비밀번호가 틀렸다는 신호는 없으므로 재인증이 안전하다.
+  //
+  // 이 판정만으로는 무한 재인증을 막지 못한다. 쿠키를 잘못 다루는 흐름 버그가 있으면
+  // 재인증 → NO_SESSION → 재인증이 돌고, SESSION_EXPIRED는 시도 횟수를 깎지 않는다.
+  // 그래도 여기서 UNKNOWN으로 올리지 않는 이유는 분류기가 상태 없는 함수라서다. 응답
+  // 하나만 보고는 "서버가 세션을 비운 정상 상황"(재시작, `/admin/reset`)과 흐름 버그를
+  // 가를 수 없고, 앞의 것까지 DLQ로 보내면 멀쩡한 작업이 버려진다. 가를 수 있는 것은
+  // 직전에 재인증했는지 아는 세션 계층(#9)이다. 재인증 직후 첫 요청이 다시 세션 실패면
+  // 흐름 버그로 보고 UNKNOWN으로 올리는 것이 그쪽 책임이다.
   if (readErrorCode(input.body) === 'NO_SESSION') {
     return { ok: false, kind: 'SESSION_EXPIRED', detail: 'HTTP 401, 본문 NO_SESSION (세션 없음)' };
   }
@@ -181,16 +195,27 @@ function classify401(input: RawResponse): Classification {
 
 /**
  * 403은 대상 서버가 네 경우에 낸다. 출발지 차단(`Retry-After` 있음), 2차 인증 전
- * 조회(`OTP_REQUIRED`), 2차 인증 실패(`OTP_REJECTED`), 계좌 불일치(`ACCOUNT_MISMATCH`).
+ * 조회(`OTP_REQUIRED`), 2차 인증 실패(`OTP_REJECTED`, `/auth/otp` 응답), 계좌
+ * 불일치(`ACCOUNT_MISMATCH`).
  *
- * 출발지 차단은 본문 문구가 아니라 `Retry-After` 유무로 가른다(이슈 #11 코멘트의 결정).
- * 문구는 공지 없이 바뀌고, 차단 판정은 대상 서버에서 항상 이 헤더와 함께 나간다.
+ * 출발지 차단은 본문 문구가 아니라 `Retry-After` **헤더가 있는지**로 가른다(이슈 #11
+ * 코멘트의 결정). 문구는 공지 없이 바뀌고, 대상 서버는 차단에 항상 이 헤더를 싣는다.
+ * 값을 정수로 못 읽는다고(HTTP 날짜, 빈 값, `30s`) 차단이 아니게 되지 않는다. 대기
+ * 시간만 모르는 것이라 429와 같은 기본 대기를 쓰고 detail에 해석 불가를 남긴다.
  */
 function classify403(input: RawResponse): Classification {
   const code = readErrorCode(input.body);
-  const retryAfter = readRetryAfter(input.headers);
-  if (retryAfter.ok) {
-    return { ok: false, kind: 'IP_BLOCKED', detail: `HTTP 403 + Retry-After${errorCodeSuffix(input)}`, retryAfterSec: retryAfter.value };
+  if (headerPresent(input.headers, 'retry-after')) {
+    const retryAfter = readRetryAfter(input.headers);
+    if (retryAfter.ok) {
+      return { ok: false, kind: 'IP_BLOCKED', detail: `HTTP 403 + Retry-After${errorCodeSuffix(input)}`, retryAfterSec: retryAfter.value };
+    }
+    return {
+      ok: false,
+      kind: 'IP_BLOCKED',
+      detail: `HTTP 403 + Retry-After ${retryAfter.reason}${errorCodeSuffix(input)}. 기본 대기 ${DEFAULT_RATE_LIMIT_WAIT_SEC}초를 쓴다`,
+      retryAfterSec: DEFAULT_RATE_LIMIT_WAIT_SEC,
+    };
   }
 
   if (code === 'OTP_REJECTED') {
