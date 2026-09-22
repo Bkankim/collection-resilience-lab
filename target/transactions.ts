@@ -39,7 +39,13 @@ const LEDGER_START_MS = Date.UTC(2026, 0, 2, 0, 0, 0);
 const STEP_MS = 6 * 60 * 60 * 1000;
 const OPENING_BALANCE = 3_250_000;
 
-const MEMOS = ['급여', '카드대금', '계좌이체', 'ATM출금', '관리비', '통신요금', '이자', '보험료'] as const;
+/**
+ * 적요는 방향과 묶는다. 해시로 적요와 입출금을 따로 고르면 "카드대금 입금"
+ * 같은 행이 나온다. 파싱만 보면 멀쩡하지만 화면으로는 말이 안 되고, 금융
+ * 도메인 화면을 모사한다면서 도메인을 안 본 티가 그대로 난다.
+ */
+const DEPOSIT_MEMOS = ['급여', '이자', '계좌이체', '환급'] as const;
+const WITHDRAWAL_MEMOS = ['카드대금', 'ATM출금', '관리비', '통신요금', '보험료'] as const;
 
 /**
  * FNV-1a 32비트 해시.
@@ -72,11 +78,22 @@ export function buildLedger(accountNo: string, count: number): readonly Transact
 
   for (let seq = 1; seq <= count; seq += 1) {
     const h = hash32(`${accountNo}:${seq}`);
-    // as: MEMOS는 as const 배열이라 나머지 연산 결과가 범위를 벗어날 수 없다.
+    const withdrawalAmount = (((h >>> 8) % 900) + 1) * 1000;
+
+    // 출금이 잔액을 음수로 만들 차례면 입금으로 뒤집는다. **직전 잔액만** 보므로
+    // 앞에서부터 계산하는 한 결과는 그대로 결정론이다. 이걸 안 하면 137건 중
+    // 125건이 음수가 되고 첫 화면부터 마이너스 잔액이 보인다.
+    const isDeposit = h % 3 === 0 || balance - withdrawalAmount < 0;
+    const amount = isDeposit ? (((h >>> 8) % 1800) + 200) * 1000 : withdrawalAmount;
+
+    // as: as const 배열이라 나머지 연산 결과가 범위를 벗어날 수 없다.
     // noUncheckedIndexedAccess는 그걸 모르므로 여기서만 좁혀 준다.
-    const memo = MEMOS[h % MEMOS.length] as string;
-    const isDeposit = h % 5 === 0;
-    const amount = (((h >>> 8) % 900) + 1) * 1000;
+    const memo = (
+      isDeposit
+        ? DEPOSIT_MEMOS[(h >>> 4) % DEPOSIT_MEMOS.length]
+        : WITHDRAWAL_MEMOS[(h >>> 4) % WITHDRAWAL_MEMOS.length]
+    ) as string;
+
     const at = new Date(LEDGER_START_MS + (seq - 1) * STEP_MS + ((h >>> 20) % 21_600) * 1000);
 
     balance += isDeposit ? amount : -amount;

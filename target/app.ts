@@ -41,7 +41,7 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
   const app = Fastify({
     logger: options.logger ?? false,
     // 기본값이지만 명시한다. 켜면 `request.ip`가 X-Forwarded-For를 읽게 되고,
-    // 그 순간 출발지 차단을 헤더 한 줄로 우회할 수 있다.
+    // 그 순간 출발지 차단이 헤더 한 줄로 풀린다.
     trustProxy: false,
   });
 
@@ -56,8 +56,12 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
     reply
       .code(verdict.kind === 'RATE_LIMITED' ? 429 : 403)
       .send({ error: verdict.kind, origin, retryAfterSec: verdict.retryAfterSec });
-    // async 훅에서 응답을 보냈으면 reply를 돌려줘야 Fastify가 라우트로
-    // 넘어가지 않는다. 안 돌려주면 핸들러가 한 번 더 돈다.
+    // `send()`를 부르면 Fastify가 `reply.sent`를 보고 훅 체인을 멈춘다
+    // (fastify 5.12.5 `lib/hooks.js`). 그래서 **이 자리에서는** `return reply`가
+    // 있든 없든 라우트 핸들러가 돌지 않는다. 네 조합을 직접 돌려 확인했다.
+    // 돌려주는 것이 실제로 갈리는 경우는 `send()`를 프로미스 체인 밖
+    // (타이머·콜백)에서 부를 때다. 그때는 안 돌려주면 핸들러가 그대로 실행된다.
+    // 지금은 필요 없지만 문서 권고대로 명시해 둔다.
     return reply;
   });
 
@@ -127,12 +131,17 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
     }
 
     const query = asRecord(request.query);
-    const requested = asString(query.account);
-    if (requested !== '' && requested !== account.accountNo) {
+
+    const accountParam = singleQueryValue(query.account);
+    if (!accountParam.ok) return reply.code(400).send({ error: 'BAD_QUERY' });
+    if (accountParam.value !== '' && accountParam.value !== account.accountNo) {
       return reply.code(403).send({ error: 'ACCOUNT_MISMATCH' });
     }
 
-    const rawPage = asString(query.page);
+    const pageParam = singleQueryValue(query.page);
+    if (!pageParam.ok) return reply.code(400).send({ error: 'BAD_QUERY' });
+
+    const rawPage = pageParam.value;
     const page = rawPage === '' ? 1 : Number(rawPage);
     if (!/^\d*$/.test(rawPage) || !Number.isInteger(page) || page < 1) {
       // 잘못된 페이지를 1페이지로 바꿔 주지 않는다. 그러면 수집하는 쪽의 버그가
@@ -260,4 +269,18 @@ function asRecord(value: unknown): Record<string, unknown> {
 
 function asString(value: unknown): string {
   return typeof value === 'string' ? value : '';
+}
+
+/**
+ * 쿼리 값 하나를 꺼낸다. 같은 키가 두 번 오면(`?page=1&page=2`) Fastify는
+ * 배열로 준다.
+ *
+ * 그걸 빈 문자열로 뭉개면 "안 보낸 것"과 구분이 안 되고, 400을 주기로 한
+ * 잘못된 값이 조용히 기본값으로 바뀐다. 실제로 `?page=abc&page=1`이 400이
+ * 아니라 1페이지를 돌려주고 있었다. 배열은 값이 아니라 오류로 돌린다.
+ */
+function singleQueryValue(value: unknown): { ok: true; value: string } | { ok: false } {
+  if (value === undefined) return { ok: true, value: '' };
+  if (typeof value === 'string') return { ok: true, value };
+  return { ok: false };
 }

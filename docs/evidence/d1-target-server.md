@@ -11,17 +11,19 @@
 |---|---|
 | 채취일 | 2026-09-22 |
 | Node | v26.4.0 |
-| 서버 | `PORT=8081 tsx target/server.ts` |
+| 서버 | `PORT=8081 tsx target/server.ts` (새로 띄운 프로세스에 한 번에 채취) |
 | 계정 | `demo01` / `demo-pass-01` (리포에 공개된 실험용 고정 계정) |
 | 출발지 | 전부 `127.0.0.1`. 출발지 분리는 프록시 컨테이너를 붙이는 D3(#14)에서 다룹니다 |
 
-스위치 임계값은 절마다 다릅니다. 각 절의 `POST /admin/switches` 응답에 그때
-적용된 `W/N/M/T/S`가 전부 찍혀 있습니다. 수치는 조건과 같이 봐야 합니다.
+9·10·11절은 각각 `POST /admin/reset` 뒤에 **스위치 3개와 임계값 5개를 전부
+명시해서** 조건을 세웁니다. 관리 API의 설정은 병합이라 빠뜨린 키에 이전 값이
+남고, 그러면 절끼리 조건이 새어 조건을 기록한다는 문서가 자기 조건을 틀리게
+적게 됩니다. 각 절의 첫 응답에 그때 적용된 `W/N/M/T/S`가 전부 찍혀 있습니다.
+수치는 조건과 같이 봐야 합니다.
 
-> 9·10절에서 통과한 요청이 401인 것은 직전 `POST /admin/reset`이 세션까지
+> 9·10절에서 차단을 통과한 요청이 200이 아니라 401인 것은 직전 `reset`이 세션도
 > 지웠기 때문입니다. **차단 판정이 인증보다 먼저 일어나는 것**이 여기서 보입니다.
-> 차단이 걸린 요청은 429/403이고, 차단을 통과한 요청만 인증 단계로 내려가 401을
-> 받습니다.
+> 차단에 걸린 요청은 429/403이고, 통과한 요청만 인증 단계로 내려가 401을 받습니다.
 
 ---
 
@@ -56,10 +58,10 @@ content-type: application/json; charset=utf-8
 ```
 $ curl -i -X POST $B/login -d '{"id":"demo01","password":"demo-pass-01"}'
 HTTP/1.1 200 OK
-set-cookie: lab_session=XMZl2pKzmPTKZiIY3NNt26m75sllLGQ-; Path=/; HttpOnly; SameSite=Lax; Max-Age=1800
+set-cookie: lab_session=rhbebuX2sveBCbGDhSa0FqCTV3YhA8q5; Path=/; HttpOnly; SameSite=Lax; Max-Age=1800
 content-type: application/json; charset=utf-8
 
-# 1차 세션 식별자: XMZl2pKzmPTK...
+# 1차 세션 식별자: rhbebuX2sveB...
 ```
 
 ### 4. 1차만 통과한 세션으로 조회 -> 403
@@ -83,10 +85,10 @@ content-type: application/json; charset=utf-8
 ```
 $ curl -i -b jar -X POST $B/auth/otp -d '{"token":"<TOTP>"}'
 HTTP/1.1 200 OK
-set-cookie: lab_session=6TULtcOTpXM8aZVHhGPM-YI0Y1PgPZNB; Path=/; HttpOnly; SameSite=Lax; Max-Age=1800
+set-cookie: lab_session=GdcHk-gmf3SEaSifPiHZX0_UjuVr19w6; Path=/; HttpOnly; SameSite=Lax; Max-Age=1800
 content-type: application/json; charset=utf-8
 
-# 2차 세션 식별자: 6TULtcOTpXM8...   1차와 다른가: 예
+# 2차 세션 식별자: GdcHk-gmf3SE...   1차와 다른가: 예
 ```
 
 ### 7. 거래내역 조회 -> 200, EUC-KR
@@ -95,7 +97,7 @@ content-type: application/json; charset=utf-8
 $ curl -i -b jar '$B/transactions?page=1'
 HTTP/1.1 200 OK
 content-type: text/html; charset=euc-kr
-content-length: 5415
+content-length: 5423
 
 # 본문 바이트 - 한글이 EUC-KR 2바이트인지 (c6e4 c0cc c1f6 = 페이지)
 00000110: 3120 2f20 3720 c6e4 c0cc c1f6 0a20 203c  1 / 7 .......  <
@@ -103,8 +105,8 @@ content-length: 5415
 
 # EUC-KR로 디코드
   <p id="summary" data-account="000-11-222333" data-total="137" data-page="1" data-page-size="20" data-total-pages="7">
-        <td class="memo">보험료</td>
-        <td class="memo">계좌이체</td>
+        <td class="memo">ATM출금</td>
+        <td class="memo">통신요금</td>
 ```
 
 ### 8. 마지막 페이지(7) 이후 -> 빈 목록이지만 표 구조는 그대로
@@ -121,10 +123,11 @@ $ curl -b jar '$B/transactions?page=8' | iconv -f EUC-KR -t UTF-8
 ### 9. 속도 제한 W=10초 / N=2회
 
 ```
-$ curl -X POST $B/admin/switches -d '{"switches":{"rateLimit":true},"thresholds":{"windowSec":10,"maxRequests":2}}'
-{"switches":{"rateLimit":true,"ipBlock":false,"sessionExpiry":true},"thresholds":{"windowSec":10,"maxRequests":2,"blockAfter":2,"blockDurationSec":5,"sessionTtlSec":1}}
+$ curl -X POST $B/admin/switches -d '<스위치 3개·임계값 5개 전부 명시>'   # 적용된 조건은 아래 응답 그대로
+{"switches":{"rateLimit":true,"ipBlock":false,"sessionExpiry":false},"thresholds":{"windowSec":10,"maxRequests":2,"blockAfter":3,"blockDurationSec":30,"sessionTtlSec":60}}
 
-# 같은 출발지로 연속 4회 (세션은 유효하므로 통과 시 200)
+# 같은 출발지로 연속 4회. 직전 reset이 세션도 지웠으므로 차단을 통과한
+# 요청은 인증 단계로 내려가 401이 된다. 차단된 요청만 429다.
   1회: 401
   2회: 401
   3회: 429 (Retry-After: 10)
@@ -137,8 +140,8 @@ $ curl -X POST $B/admin/switches -d '{"switches":{"rateLimit":true},"thresholds"
 ### 10. 출발지 차단 M=2회 누적 / T=5초
 
 ```
-$ curl -X POST $B/admin/switches -d '{"switches":{"rateLimit":true,"ipBlock":true},"thresholds":{"windowSec":10,"maxRequests":2,"blockAfter":2,"blockDurationSec":5}}'
-{"switches":{"rateLimit":true,"ipBlock":true,"sessionExpiry":true},"thresholds":{"windowSec":10,"maxRequests":2,"blockAfter":2,"blockDurationSec":5,"sessionTtlSec":1}}
+$ curl -X POST $B/admin/switches -d '<스위치 3개·임계값 5개 전부 명시>'   # 적용된 조건은 아래 응답 그대로
+{"switches":{"rateLimit":true,"ipBlock":true,"sessionExpiry":false},"thresholds":{"windowSec":10,"maxRequests":2,"blockAfter":2,"blockDurationSec":5,"sessionTtlSec":60}}
 
 # 같은 출발지로 연속 5회 - 2회 통과 -> 429(누적 1) -> 누적 2에서 차단 403
   1회: 401
@@ -159,8 +162,8 @@ $ curl -X POST $B/admin/switches -d '{"switches":{"rateLimit":true,"ipBlock":tru
 ### 11. 세션 만료 S=1초 -> 401 + X-Session-Expired
 
 ```
-$ curl -X POST $B/admin/switches -d '{"switches":{"sessionExpiry":true},"thresholds":{"sessionTtlSec":1}}'
-{"switches":{"rateLimit":false,"ipBlock":false,"sessionExpiry":true},"thresholds":{"windowSec":10,"maxRequests":2,"blockAfter":2,"blockDurationSec":5,"sessionTtlSec":1}}
+$ curl -X POST $B/admin/switches -d '<스위치 3개·임계값 5개 전부 명시>'   # 적용된 조건은 아래 응답 그대로
+{"switches":{"rateLimit":false,"ipBlock":false,"sessionExpiry":true},"thresholds":{"windowSec":10,"maxRequests":5,"blockAfter":3,"blockDurationSec":30,"sessionTtlSec":1}}
 
 # 발급 직후
   200  (X-Session-Expired 없음)
@@ -172,12 +175,12 @@ $ curl -X POST $B/admin/switches -d '{"switches":{"sessionExpiry":true},"thresho
 
 # 쿠키 자에는 남아 있다. Max-Age를 S와 같게 뒀다면 curl이 여기서 쿠키를
 # 스스로 버려서 서버가 만료 이유를 말할 기회가 없어진다.
-  lab_session (만료 1790071390)
+  lab_session (만료 1790072896)
 ```
 
 ### 12. 최종 스위치 상태 (측정 조건으로 결과표에 함께 적는다)
 
 ```
 $ curl $B/admin/switches
-{"switches":{"rateLimit":false,"ipBlock":false,"sessionExpiry":true},"thresholds":{"windowSec":10,"maxRequests":2,"blockAfter":2,"blockDurationSec":5,"sessionTtlSec":1}}
+{"switches":{"rateLimit":false,"ipBlock":false,"sessionExpiry":true},"thresholds":{"windowSec":10,"maxRequests":5,"blockAfter":3,"blockDurationSec":30,"sessionTtlSec":1}}
 ```

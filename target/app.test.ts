@@ -16,7 +16,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { DEMO_ACCOUNTS, MAX_PASSWORD_FAILURES } from './accounts.js';
 import { buildApp } from './app.js';
 import { SESSION_COOKIE_MAX_AGE_SEC } from './sessions.js';
-import { PAGE_SIZE } from './transactions.js';
+import { PAGE_SIZE, buildLedger } from './transactions.js';
 
 const ACCOUNT = DEMO_ACCOUNTS[0]!;
 const OTHER = DEMO_ACCOUNTS[1]!;
@@ -336,6 +336,40 @@ describe('#7 거래내역 조회와 EUC-KR 응답', () => {
     }
   });
 
+  it('잔액이 음수로 내려가지 않고 적요와 입출금 방향이 맞는다', async () => {
+    // 해시로 적요와 방향을 따로 고르면 "카드대금 입금" 같은 행이 나온다.
+    // 파싱만 보면 멀쩡해서 테스트가 없으면 끝까지 안 걸린다.
+    const deposits = new Set(['급여', '이자', '계좌이체', '환급']);
+
+    for (const account of DEMO_ACCOUNTS) {
+      const ledger = buildLedger(account.accountNo, account.txCount);
+      expect(ledger.length, account.id).toBe(account.txCount);
+
+      for (const tx of ledger) {
+        expect(tx.balance, `${account.id} seq ${tx.seq} 잔액`).toBeGreaterThanOrEqual(0);
+        // 한 행은 입금이거나 출금이지 둘 다이거나 둘 다 아닐 수 없다.
+        expect(tx.deposit > 0, `${account.id} seq ${tx.seq} 방향`).toBe(tx.withdrawal === 0);
+        expect(deposits.has(tx.memo), `${account.id} seq ${tx.seq} 적요 ${tx.memo}`).toBe(tx.deposit > 0);
+      }
+    }
+  });
+
+  it('같은 쿼리 키가 두 번 오면 기본값으로 뭉개지 않고 400을 준다', async () => {
+    const lab = makeLab();
+    const cookie = await fullSession(lab);
+
+    // Fastify는 중복 키를 배열로 준다. 그걸 빈 문자열로 뭉개면 "안 보낸 것"과
+    // 같아져서, 400을 주기로 한 잘못된 값이 조용히 1페이지로 바뀐다.
+    for (const query of ['page=1&page=2', 'page=abc&page=1', `account=${OTHER.accountNo}&account=${ACCOUNT.accountNo}`]) {
+      const res = await lab.app.inject({
+        method: 'GET',
+        url: `/transactions?${query}`,
+        headers: { cookie },
+      });
+      expect(res.statusCode, query).toBe(400);
+    }
+  });
+
   it('세션 계정이 아닌 계좌는 조회할 수 없다', async () => {
     const lab = makeLab();
     const cookie = await fullSession(lab);
@@ -414,6 +448,33 @@ describe('#8 차단 스위치 3종과 관리 API', () => {
     // 해제와 함께 누적도 지워졌다. 안 지우면 해제 직후 429 한 번에 다시 차단된다.
     const next = await lab.app.inject({ method: 'GET', url: '/transactions', ...from });
     expect(next.statusCode).toBe(401);
+  });
+
+  it('출발지 차단을 끄면 429가 아무리 쌓여도 403이 되지 않는다', async () => {
+    const lab = makeLab();
+    const from = { remoteAddress: '10.0.0.7' };
+    await configure(lab, {
+      switches: { rateLimit: true, ipBlock: false },
+      thresholds: { windowSec: 60, maxRequests: 1, blockAfter: 2 },
+    });
+
+    // 스위치를 켠 쪽만 검증하면 ipBlock이 늘 켜진 것처럼 동작해도 테스트가 통과한다.
+    const codes: number[] = [];
+    for (let i = 0; i < 5; i += 1) {
+      codes.push((await lab.app.inject({ method: 'GET', url: '/transactions', ...from })).statusCode);
+    }
+    expect(codes).toEqual([401, 429, 429, 429, 429]);
+
+    // 같은 조건에서 ipBlock만 켜면 M회 누적에서 403으로 넘어간다.
+    await configure(lab, {
+      switches: { rateLimit: true, ipBlock: true },
+      thresholds: { windowSec: 60, maxRequests: 1, blockAfter: 2 },
+    });
+    const withBlock: number[] = [];
+    for (let i = 0; i < 4; i += 1) {
+      withBlock.push((await lab.app.inject({ method: 'GET', url: '/transactions', ...from })).statusCode);
+    }
+    expect(withBlock).toEqual([401, 429, 403, 403]);
   });
 
   it('출발지는 소켓 주소로 판정하고 X-Forwarded-For를 믿지 않는다', async () => {
