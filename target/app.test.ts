@@ -336,6 +336,20 @@ describe('#7 거래내역 조회와 EUC-KR 응답', () => {
     }
   });
 
+  it('안전한 정수 범위를 넘는 페이지 번호는 400을 준다', async () => {
+    // Number()가 정밀도를 잃은 채 정수로 돌려주면 200에 data-page="1e+23"이 나간다.
+    const lab = makeLab();
+    const cookie = await fullSession(lab);
+
+    for (const page of ['99999999999999999999999', String(Number.MAX_SAFE_INTEGER + 1)]) {
+      const res = await lab.app.inject({ method: 'GET', url: `/transactions?page=${page}`, headers: { cookie } });
+      expect(res.statusCode, `page=${page}`).toBe(400);
+      expect(res.json(), `page=${page}`).toEqual({ error: 'BAD_PAGE' });
+    }
+    const edge = await lab.app.inject({ method: 'GET', url: `/transactions?page=${Number.MAX_SAFE_INTEGER}`, headers: { cookie } });
+    expect(edge.statusCode).toBe(200);
+  });
+
   it('잔액이 음수로 내려가지 않고 적요와 입출금 방향이 맞는다', async () => {
     // 해시로 적요와 방향을 따로 고르면 "카드대금 입금" 같은 행이 나온다.
     // 파싱만 보면 멀쩡해서 테스트가 없으면 끝까지 안 걸린다.

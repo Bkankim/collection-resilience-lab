@@ -143,9 +143,13 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
 
     const rawPage = pageParam.value;
     const page = rawPage === '' ? 1 : Number(rawPage);
-    if (!/^\d*$/.test(rawPage) || !Number.isInteger(page) || page < 1) {
+    if (!/^\d*$/.test(rawPage) || !Number.isSafeInteger(page) || page < 1) {
       // 잘못된 페이지를 1페이지로 바꿔 주지 않는다. 그러면 수집하는 쪽의 버그가
       // 정상 응답에 묻혀서 같은 페이지를 반복해 긁는다.
+      //
+      // `isInteger`가 아니라 `isSafeInteger`다. 2^53을 넘는 자릿수는 `Number()`가
+      // 정밀도를 잃은 채 정수로 돌려주고 `isInteger`도 통과시킨다. 그러면 200에
+      // `data-page="1e+23"`이 렌더되어, 수집하는 쪽이 숫자로 못 읽는 요약을 받는다.
       return reply.code(400).send({ error: 'BAD_PAGE' });
     }
 
