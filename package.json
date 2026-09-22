@@ -25,6 +25,7 @@
   "dependencies": {
     "fastify": "^5.12.5",
     "iconv-lite": "^0.7.3",
-    "otplib": "^13.5.0"
+    "otplib": "^13.5.0",
+    "undici": "8.10.2"
   }
 }
