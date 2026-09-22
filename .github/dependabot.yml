@@ -3,8 +3,23 @@ updates:
   - package-ecosystem: "npm"
     directory: "/"
     schedule:
-      interval: "weekly"
+      # 작업 기간에는 PR이 쌓이지 않게 한다. 기간이 끝나면 weekly로 되돌린다.
+      interval: "monthly"
+    ignore:
+      # @types/node 메이저는 engines.node 최저값(22)에 맞춰 고정한다.
+      #
+      # 로컬 개발은 Node 26에서 한다. 타입만 26으로 올리면 22에 없는 API를
+      # 써도 타입 검사가 통과하고, CI의 Node 22 잡은 그 코드 경로를 테스트가
+      # 밟을 때만 잡는다. 타입을 최저 지원 버전에 묶어 두는 쪽이 정적으로 먼저 걸린다.
+      #
+      # 올리는 시점은 engines.node 최저값을 올릴 때다.
+      - dependency-name: "@types/node"
+        update-types: ["version-update:semver-major"]
+
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
-      interval: "weekly"
+      interval: "monthly"
+    groups:
+      actions:
+        patterns: ["*"]
