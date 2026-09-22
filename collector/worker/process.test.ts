@@ -257,7 +257,7 @@ suite('큐 워커: 속도 제한(rate-limit 처분)', () => {
     await lab.waitFinished(warm);
     // 2) 세 번째 작업이 429를 받아 큐 전체 제한을 건다. 이 작업은 대기로 돌아가고, 다른 워커
     //    하나는 놀고 있다. 큐 전체가 멈추지 않았다면 그 워커가 바로 이 작업을 꺼내 로그인을
-    //    보내고 또 429를 받는다(limiter를 뺀 대조 실행에서 5ms 뒤에 그랬다: d2-pipeline.md).
+    //    보내고 또 429를 받는다(limiter를 뺀 대조 실행에서 5ms 뒤에 그랬다: TROUBLESHOOTING 5번).
     const limitedId = await lab.add(DEMO02, at(0), at(18));
     await waitUntil(() => lab.events.some((e) => e.event === 'rate-limited'));
     const limited = lab.events.find((e) => e.event === 'rate-limited') as Extract<Logged, { event: 'rate-limited' }>;
