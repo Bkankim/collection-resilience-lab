@@ -45,11 +45,6 @@ export type CollectionJobData = {
 export type CollectionCheckpoint = {
   /** 다시 시작할 때 받을 페이지. 이 앞 페이지의 행은 결과 저장소에 이미 있다. */
   nextPage: number;
-  /**
-   * 새 페이지 없이 지나간 속도 제한·차단 주기가 몇 번 이어졌나. 한 페이지라도 받으면 0이다.
-   * 워커의 상한(`noProgressCycles`)에 닿으면 NO_PROGRESS로 DLQ에 간다(`DeadLetterKind`).
-   */
-  noProgressCycles: number;
 };
 
 /**
@@ -220,9 +215,10 @@ export function formatFailedReason(kind: DeadLetterKind, detail: string): string
 /**
  * 최종 실패에 남는 종류. 분류기의 일곱 종에 워커가 붙이는 NO_PROGRESS 하나를 더한다.
  *
- * NO_PROGRESS(#19): 속도 제한·출발지 차단 주기를 워커의 상한(기본 3)번 연달아 거치는 동안
- * 새 페이지를 하나도 받지 못한 작업이다. 창(N)이 로그인 비용(2요청) 이하면 영원히 한 페이지도
- * 못 받는데, 속도 제한은 시도 횟수를 깎지 않아(`CONSUMES_ATTEMPT`) 저절로 끝나지 않는다.
+ * NO_PROGRESS(#19): 큐 전체가 속도 제한·출발지 차단 주기를 워커의 상한(기본 3)번 연달아 거치는
+ * 동안 어느 작업도 새 페이지를 받지 못했을 때, 그 주기에 제한을 받은 작업이다(`progressKey`).
+ * 창(N)이 로그인 비용 이하면 영원히 한 페이지도 못 받는데, 속도 제한은 시도 횟수를 깎지 않아
+ * (`CONSUMES_ATTEMPT`) 저절로 끝나지 않는다.
  *
  * **`FailureKind`에 넣지 않는다.** 분류기의 일곱 종은 응답 하나를 보고 정하는 것이고
  * `FIRST_REMEDY`·`CONSUMES_ATTEMPT`·`DISPOSITION`이 그 일곱 종에 대한 표다. NO_PROGRESS는
@@ -355,4 +351,24 @@ export type DeadLetterData = {
  */
 export function authBlockKey(queueName: string, loginId: string): string {
   return `authblock:${queueName}:${loginId}`;
+}
+
+/**
+ * 큐 전체의 진행 상태 키(#19 진행 기반 상한). Redis 해시 하나에 필드 넷이다.
+ *
+ * - `pages`: 이 큐의 어느 작업이든 페이지를 받을 때마다 1씩 오른다.
+ * - `seen`: 직전 속도 제한·차단 주기를 셀 때의 `pages`.
+ * - `cycles`: 큐 전체에서 새 페이지 없이 이어진 주기 수. NO_PROGRESS는 이것만 본다.
+ * - `until`: 직전 주기의 큐 정지가 끝나는 시각(Redis `TIME` 기준 ms). 이보다 이른 제한은 같은
+ *   주기로 본다.
+ *
+ * 작업마다 세지 않고 큐 전체로 세는 이유: 워커 2개가 같은 출발지로 동시에 출발하면 로그인 두 벌(4요청)이
+ * 창(N=5)을 거의 다 써서 주기마다 한 작업만 한 페이지를 받는다. 작업마다 세면 경쟁에서 계속 진
+ * 작업이 큐는 나아가는데도 NO_PROGRESS로 갔다(`docs/evidence/d3-resume.md`). 환경이 막혔는지는
+ * 출발지, 곧 큐 전체의 성질이다.
+ *
+ * 만료를 두지 않는다. 필드 넷짜리 해시 하나이고, 만료로 사라지면 연속 횟수가 조용히 0이 된다.
+ */
+export function progressKey(queueName: string): string {
+  return `progress:${queueName}`;
 }

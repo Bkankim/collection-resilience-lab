@@ -99,7 +99,7 @@ async function makeLab() {
   cleanups.push(async () => {
     for (const w of workers) await w.close();
     for (const c of connections) c.disconnect();
-    for (const pattern of [`results:${name}:*`, `authblock:${name}:*`]) {
+    for (const pattern of [`results:${name}:*`, `authblock:${name}:*`, `progress:${name}`]) {
       const keys = await redis.keys(pattern);
       if (keys.length > 0) await redis.del(...keys);
     }
@@ -691,6 +691,41 @@ suite('큐 워커: 이어받기와 진행 기반 상한(#19)', () => {
     expect(await lab.deadLetter.count()).toBe(0);
   });
 
+  it('워커 2개가 창을 나눠 쓰며 한 작업이 주기마다 한 페이지도 못 받아도, 큐 전체가 나아가는 한 두 작업 모두 완료한다', { timeout: 40_000 }, async () => {
+    const target = await startTarget();
+    // 창 2초에 5개, 429 세 번에 2초 차단. 기본값(10초·30초)과 모양은 같고 시간만 줄였다.
+    await target.configure({
+      switches: { rateLimit: true, ipBlock: true },
+      thresholds: { windowSec: 2, maxRequests: 5, blockAfter: 3, blockDurationSec: 2 },
+    });
+    const lab = await makeLab();
+    const LATE = { from: '2026-01-02 00:00:00', to: ALL.to };
+    const lateStarts: number[] = [];
+    const real = realCollect(target.origin);
+    // 늦은 작업은 0.1초 늦게 출발한다. 두 작업이 같은 주기에 출발하면 이른 작업이 창(로그인 2 +
+    // 페이지 3)을 먼저 다 쓰고, 늦은 작업은 로그인에서 429·403을 받는다. 경쟁을 고정해서 늦은
+    // 작업이 처음 세 주기를 한 페이지도 없이 지나게 한다(작업 단위로 세면 여기서 NO_PROGRESS다).
+    const collectFn = async (data: CollectionJobData, options: CollectOptions) => {
+      if (data.from === LATE.from) {
+        lateStarts.push(options.startPage ?? 1);
+        await sleep(100);
+      }
+      return real(data, options);
+    };
+    await lab.startWorker('w1', collectFn);
+    await lab.startWorker('w2', collectFn);
+    const early = await lab.add(DEMO01, ALL.from, ALL.to);
+    const late = await lab.add(DEMO01, LATE.from, LATE.to);
+    expect(await lab.waitFinished([early, late], 35_000)).toEqual({ [early]: 'completed', [late]: 'completed' });
+
+    expect(lateStarts.slice(0, 3)).toEqual([1, 1, 1]);
+    expect(lab.events.some((e) => e.event === 'rate-limited' && e.kind === 'IP_BLOCKED')).toBe(true);
+    const ledger = buildLedger(DEMO01.accountNo, DEMO01.count);
+    expect(await readResults(lab.redis, lab.queue.name, early)).toEqual(ledger);
+    expect(await readResults(lab.redis, lab.queue.name, late)).toEqual(ledger.filter((r) => r.at >= LATE.from));
+    expect(await lab.deadLetter.count()).toBe(0);
+  });
+
   // 이어받는 실행이 4페이지를 받고 결과를 쓰는 자리에서 워커가 죽는다. 'after'는 행을 쓴 뒤·체크포인트
   // 전(같은 페이지를 다시 쓰게 된다), 'before'는 행을 쓰기 전(체크포인트가 행보다 먼저면 그 페이지가
   // 빠진다). 죽음은 결과 쓰기를 영영 돌아오지 않게 하고 워커를 강제로 닫아 만든다. 잠금이 풀리면
@@ -771,6 +806,20 @@ suite('큐 워커: 이어받기와 진행 기반 상한(#19)', () => {
     expect(dead).toMatchObject({ originalId: id, kind: 'NO_PROGRESS', attemptsMade: 1, raw: null });
     expect(await lab.deadLetter.count()).toBe(1);
     expect(await lab.redis.hlen(resultsKey(lab.queue.name, id))).toBe(0);
+  });
+
+  it('상한에 닿은 뒤 대기 중이던 작업도 한 주기를 더 보내 보고 같은 NO_PROGRESS로 끝난다', { timeout: 20_000 }, async () => {
+    const target = await startTarget();
+    await target.configure({ switches: { rateLimit: true }, thresholds: { windowSec: 1, maxRequests: 2 } });
+    const lab = await makeLab();
+    await lab.startWorker('w1', realCollect(target.origin));
+    const ids = [await lab.add(DEMO01, ALL.from, ALL.to), await lab.add(DEMO01, '2026-01-02 00:00:00', ALL.to)];
+    expect(await lab.waitFinished(ids, 15_000)).toEqual({ [ids[0] as string]: 'failed', [ids[1] as string]: 'failed' });
+
+    // 상한(3)까지 세 주기, 대기 작업이 한 주기. 대기 작업을 꺼낼 때 미리 실패시켰다면 3이다.
+    expect(pageTrace(target.hits)).toEqual(['1(429)', '1(429)', '1(429)', '1(429)']);
+    const dead = (await lab.deadLetter.getJobs(['waiting'])).map((j) => j.data.kind);
+    expect(dead).toEqual(['NO_PROGRESS', 'NO_PROGRESS']);
   });
 
   it('한 페이지라도 받은 주기가 끼면 진행 없는 주기 수를 처음부터 센다', { timeout: TIMEOUT }, async () => {
