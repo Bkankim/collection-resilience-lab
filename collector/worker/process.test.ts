@@ -45,7 +45,7 @@ import {
 import type { CollectionJobData, DeadLetterData } from '../queue.js';
 import { redisUrlForTests } from '../redis-for-tests.js';
 import { createCollectionWorker } from './process.js';
-import type { ProcessorDeps, ProcessorResult, WorkerEvent } from './process.js';
+import type { CollectionWorkerOptions, ProcessorDeps, ProcessorResult, WorkerEvent } from './process.js';
 
 const REDIS_URL = redisUrlForTests();
 const suite = REDIS_URL === undefined ? describe.skip : describe;
@@ -119,10 +119,11 @@ async function makeLab() {
     async startWorker(
       workerName: string,
       collectFn: (data: CollectionJobData, options: CollectOptions) => Promise<CollectResult>,
-      extra: Pick<ProcessorDeps, 'noProgressCycles'> = {},
+      extra: Partial<Pick<ProcessorDeps, 'noProgressCycles' | 'redis'>> & Pick<CollectionWorkerOptions, 'stalled'> = {},
     ) {
       const connection = createRedis('worker', url);
       connections.push(connection);
+      const { stalled, ...deps } = extra;
       const worker = createCollectionWorker({
         connection,
         deps: {
@@ -132,8 +133,9 @@ async function makeLab() {
           deadLetter,
           clock: systemClock,
           log: (event) => events.push({ ...event, worker: workerName, t: Date.now() }),
-          ...extra,
+          ...deps,
         },
+        ...(stalled === undefined ? {} : { stalled }),
       });
       workers.push(worker);
       await worker.waitUntilReady();
@@ -653,6 +655,100 @@ suite('큐 워커: 이어받기와 진행 기반 상한(#19)', () => {
     expect(((await lab.queue.getJob(id))?.returnvalue as ProcessorResult).count).toBe(137);
     const limited = lab.events.filter((e) => e.event === 'rate-limited');
     expect(limited.map((e) => e.attemptsMade)).toEqual([0, 0]);
+    expect(await lab.deadLetter.count()).toBe(0);
+  });
+
+  it('출발지 차단을 함께 켜도, 차단 주기를 지나 받은 페이지부터 이어 가며 완료된다', { timeout: 45_000 }, async () => {
+    const target = await startTarget();
+    // W·N·M은 기본값. 차단 시간만 3초로 줄였다(기본 30초면 이 테스트가 50초다).
+    await target.configure({
+      switches: { rateLimit: true, ipBlock: true },
+      thresholds: { windowSec: 10, maxRequests: 5, blockAfter: 3, blockDurationSec: 3 },
+    });
+    // 작업 하나로는 429가 두 번뿐이라(아래 4·7페이지) M=3에 닿지 않고 차단이 나지 않는다. 같은
+    // 출발지의 다른 클라이언트가 창을 다 쓰고 429를 두 번 받은 상태를 먼저 만든다. 그러면 작업의
+    // 첫 요청(로그인)이 세 번째 429 자리라 403 IP_BLOCKED다.
+    for (let i = 0; i < 7; i += 1) await fetch(`${target.origin}/transactions`);
+    expect(target.hits.map((h) => h.status)).toEqual([401, 401, 401, 401, 401, 429, 429]);
+    const mark = target.hits.length;
+
+    const lab = await makeLab();
+    await lab.startWorker('w1', realCollect(target.origin));
+    const id = await lab.add(DEMO01, ALL.from, ALL.to);
+    expect(await lab.waitFinished([id], 40_000)).toEqual({ [id]: 'completed' });
+
+    const after = target.hits.slice(mark);
+    expect(after[0]).toMatchObject({ path: '/login', status: 403 });
+    // 차단이 풀리면 대상 서버가 카운터를 비운다. 그 뒤는 차단 없는 기본 임계값과 같다.
+    expect(pageTrace(after)).toEqual(['1', '2', '3', '4(429)', '4', '5', '6', '7(429)', '7', '8']);
+    const limited = lab.events.filter((e): e is Extract<Logged, { event: 'rate-limited' }> => e.event === 'rate-limited');
+    expect(limited.map((e) => [e.kind, e.waitMs])).toEqual([
+      ['IP_BLOCKED', 3000],
+      ['RATE_LIMITED', 10_000],
+      ['RATE_LIMITED', 10_000],
+    ]);
+    expect(await readResults(lab.redis, lab.queue.name, id)).toEqual(buildLedger(DEMO01.accountNo, DEMO01.count));
+    expect(await lab.deadLetter.count()).toBe(0);
+  });
+
+  // 이어받는 실행이 4페이지를 받고 결과를 쓰는 자리에서 워커가 죽는다. 'after'는 행을 쓴 뒤·체크포인트
+  // 전(같은 페이지를 다시 쓰게 된다), 'before'는 행을 쓰기 전(체크포인트가 행보다 먼저면 그 페이지가
+  // 빠진다). 죽음은 결과 쓰기를 영영 돌아오지 않게 하고 워커를 강제로 닫아 만든다. 잠금이 풀리면
+  // 다른 워커의 멈춤 검사가 작업을 대기로 돌린다(프로세스를 실제로 죽이는 경로는 d3-resume.md).
+  it.each([
+    ['after', 80],
+    ['before', 60],
+  ] as const)('이어받는 도중 워커가 죽어도(결과 쓰기 %s) 다른 워커가 이어받아 끝내고 결과 행이 늘지 않는다', { timeout: TIMEOUT }, async (when, rowsAtDeath) => {
+    const target = await startTarget();
+    // 창 1초에 5개. 첫 주기는 1~3페이지, 4페이지 429. 두 번째 주기가 4페이지부터 이어받는다.
+    await target.configure({ switches: { rateLimit: true }, thresholds: { windowSec: 1, maxRequests: 5 } });
+    const lab = await makeLab();
+    let hsets = 0;
+    let died!: () => void;
+    const dead = new Promise<void>((r) => (died = r));
+    const dying = new Proxy(lab.redis, {
+      get(obj, prop) {
+        if (prop === 'hset') {
+          return async (...args: unknown[]) => {
+            hsets += 1;
+            // 1~3번째는 첫 주기의 1~3페이지, 4번째가 이어받은 4페이지다.
+            if (hsets !== 4) return (obj.hset as (...a: unknown[]) => Promise<number>)(...args);
+            if (when === 'after') await (obj.hset as (...a: unknown[]) => Promise<number>)(...args);
+            died();
+            return new Promise(() => {});
+          };
+        }
+        const value = Reflect.get(obj, prop, obj) as unknown;
+        return typeof value === 'function' ? (value as (...a: unknown[]) => unknown).bind(obj) : value;
+      },
+    });
+    // w1의 멈춤 검사 주기도 줄인다. 멈춤 검사는 큐 전체에서 `stalled-check` 키(수명 = 검사한 워커의
+    // stalledInterval)로 한 번씩만 돈다. w1이 기본 30초로 먼저 돌면 w2의 검사가 30초 동안 건너뛰어진다
+    // (bullmq 6.3.8 moveStalledJobsToWait-9.lua).
+    const w1 = await lab.startWorker('w1', realCollect(target.origin), { redis: dying, stalled: { lockDuration: 1000, stalledInterval: 200 } });
+    const id = await lab.add(DEMO01, ALL.from, ALL.to);
+    await dead;
+    await w1.close(true);
+    const key = resultsKey(lab.queue.name, id);
+    expect(await lab.redis.hlen(key)).toBe(rowsAtDeath);
+    expect(pageTrace(target.hits)).toEqual(['1', '2', '3', '4(429)', '4']);
+
+    const starts: number[] = [];
+    const real = realCollect(target.origin);
+    await lab.startWorker(
+      'w2',
+      (data, options) => {
+        starts.push(options.startPage ?? 1);
+        return real(data, options);
+      },
+      { stalled: { stalledInterval: 200 } },
+    );
+    expect(await lab.waitFinished([id])).toEqual({ [id]: 'completed' });
+
+    // 체크포인트는 4페이지에 머물러 있었다. 4페이지를 한 번 더 받고 썼지만 seq 필드라 행이 늘지 않았다.
+    expect(starts[0]).toBe(4);
+    expect(await readResults(lab.redis, lab.queue.name, id)).toEqual(buildLedger(DEMO01.accountNo, DEMO01.count));
+    expect(((await lab.queue.getJob(id))?.returnvalue as ProcessorResult).count).toBe(137);
     expect(await lab.deadLetter.count()).toBe(0);
   });
 
