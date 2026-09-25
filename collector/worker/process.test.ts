@@ -833,6 +833,35 @@ suite('큐 워커: 이어받기와 진행 기반 상한(#19)', () => {
     expect(await lab.deadLetter.getJob(second)).toBeUndefined();
   });
 
+  it('같은 정지 안에서 뒤에 온 짧은 제한이 앞선 긴 정지를 줄이지 않는다(큐 정지 = 주기 창)', { timeout: TIMEOUT }, async () => {
+    const lab = await makeLab();
+    const LONG = '2026-01-02 00:00:00';
+    const starts: { from: string; t: number }[] = [];
+    let longAt = 0;
+    // A: 출발지 차단(1초, 기본값의 30초를 줄인 것). B: 그 정지 안에서 429(0.2초, 5초를 줄인 것).
+    // 대상 서버는 A의 차단이 풀릴 때까지 막혀 있다. 큐가 0.2초 뒤에 다시 꺼내면 막힌 동안 요청이 나간다.
+    const collectFn = async (data: CollectionJobData): Promise<CollectResult> => {
+      starts.push({ from: data.from, t: Date.now() });
+      const mine = starts.filter((x) => x.from === data.from).length;
+      if (mine > 1) return { ok: true, rows: [], pages: 1 };
+      if (data.from === LONG) {
+        longAt = Date.now();
+        return { ok: false, kind: 'IP_BLOCKED', detail: 'HTTP 403', retryAfterSec: 1 };
+      }
+      await waitUntil(() => lab.events.some((e) => e.event === 'rate-limited' && e.kind === 'IP_BLOCKED'));
+      await sleep(100); // A의 주기 세기와 큐 정지가 끝난 뒤
+      return { ok: false, kind: 'RATE_LIMITED', detail: 'HTTP 429', retryAfterSec: 0.2 };
+    };
+    await lab.startWorker('w1', collectFn);
+    await lab.startWorker('w2', collectFn);
+    const ids = [await lab.add(DEMO01, LONG, ALL.to), await lab.add(DEMO01, '2026-01-03 00:00:00', ALL.to)];
+    expect(await lab.waitFinished(ids)).toEqual({ [ids[0] as string]: 'completed', [ids[1] as string]: 'completed' });
+
+    // 두 제한 뒤 처음 꺼낸 시각이 A의 차단(1초)이 끝난 뒤다. 0.2초 제한이 정지를 덮어쓰면 약 0.3초다.
+    const resumed = Math.min(...starts.slice(2).map((x) => x.t));
+    expect(resumed - longAt).toBeGreaterThanOrEqual(950);
+  });
+
   // 이어받는 실행이 4페이지를 받고 결과를 쓰는 자리에서 워커가 죽는다. 'after'는 행을 쓴 뒤·체크포인트
   // 전(같은 페이지를 다시 쓰게 된다), 'before'는 행을 쓰기 전(체크포인트가 행보다 먼저면 그 페이지가
   // 빠진다). 죽음은 결과 쓰기를 영영 돌아오지 않게 하고 워커를 강제로 닫아 만든다. 잠금이 풀리면

@@ -109,6 +109,12 @@ export const DEFAULT_NO_PROGRESS_CYCLES = 3;
  *   이어받으면 회복된 큐의 첫 제한에서 멀쩡한 작업이 NO_PROGRESS로 간다(#19 리뷰 1: d3-resume.md
  *   5절이 남긴 cycles 3). 새로 세면 첫 주기는 1이라 K가 2 이상이면 그 자리에서 끝나지 않는다.
  * - `until`은 더 긴 쪽을 남긴다. 같은 주기 안에서 429(10초) 뒤 403 차단(30초)이 오면 30초다.
+ * - **큐 정지는 이 창에 맞춘다.** 스크립트는 연속 수와 함께 `until`까지 남은 시간을 돌려주고, 호출하는
+ *   쪽은 자기 Retry-After가 아니라 그 시간으로 `queue.rateLimit`을 건다. `queue.rateLimit`은 앞선 정지를
+ *   조건 없이 덮어쓰므로(bullmq 6.3.8 `setRateLimit`, SET PX), 자기 대기로 걸면 30초 차단 뒤의 5초 429가
+ *   정지를 5초로 줄이고, 풀린 뒤 25초 동안의 무진행 주기가 같은 주기로 접혀 덜 세어졌다(#19 최종 리뷰 3).
+ *   주기 창과 정지를 같은 값에서 꺼내므로 워커들의 세기·정지 순서가 엇갈려도(W1 세기 30초, W2 세기 5초,
+ *   W2 정지, W1 정지) 모두 같은 `until`로 정지를 건다. 창보다 짧게도 길게도 멈추지 않는다.
  *
  * 시각은 Redis `TIME`이다. 워커 프로세스마다 시계가 다르면 같은 주기 판정이 어긋난다.
  */
@@ -127,8 +133,9 @@ elseif pages > seen then
   cycles = 0
   redis.call('HSET', KEYS[1], 'seen', pages, 'cycles', cycles)
 end
-redis.call('HSET', KEYS[1], 'until', math.max(untilMs, now + tonumber(ARGV[1])))
-return cycles
+local newUntil = math.max(untilMs, now + tonumber(ARGV[1]))
+redis.call('HSET', KEYS[1], 'until', newUntil)
+return {cycles, newUntil - now}
 `;
 
 /**
@@ -310,10 +317,11 @@ export function createCollectionHandlers(deps: ProcessorDeps): CollectionHandler
         // 작업이 전부 DLQ로 빠진다. 대가는 대기 작업마다 한 주기(로그인 한 번)다.
         //
         // 체크포인트는 여기서 쓰지 않는다. `onPage`가 페이지마다 이미 남겼고, 던지기 전에 끝났다.
-        const cycles = Number(await redis.eval(COUNT_CYCLE, 1, progressKey(queue.name), waitMs, STALE_STREAK_MS));
+        const [cycles, pauseMs] = (await redis.eval(COUNT_CYCLE, 1, progressKey(queue.name), waitMs, STALE_STREAK_MS)) as [number, number];
         // 제한은 NO_PROGRESS로 끝낼 때도 건다. 이 작업을 끝내도 환경은 여전히 막혀 있어서, 걸지
         // 않으면 다음 작업이 바로 출발해 429를 또 받는다(출발지 차단 누적에도 들어간다).
-        await queue.rateLimit(waitMs);
+        // 정지 길이는 자기 Retry-After가 아니라 주기 창(`until`)까지다(`COUNT_CYCLE` 주석).
+        await queue.rateLimit(Math.max(1, pauseMs));
         if (cycles >= noProgressLimit) {
           const nextPage = job.data.checkpoint?.nextPage ?? 1;
           const reason =
