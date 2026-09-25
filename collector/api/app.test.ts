@@ -358,6 +358,33 @@ describe.skipIf(REDIS_URL === undefined)('수집 요청 API (Redis)', () => {
     expect(worker.calls()).toBe(1);
   });
 
+  it('워커가 작업 데이터에 남긴 체크포인트(#19)는 상태 응답의 request에 싣지 않는다', async () => {
+    const { app, queue } = await makeLab();
+    const { id } = (await post(app, BODY)).json();
+    const job = await queue.getJob(id);
+    // 워커가 페이지를 받을 때마다 하는 일과 같다(process.ts onPage).
+    await job?.updateData({ ...(job.data as CollectionJobData), checkpoint: { nextPage: 4 } });
+    expect((await queue.getJob(id))?.data).toHaveProperty('checkpoint');
+
+    const view = (await get(app, id)).json();
+    expect(view.status).toBe('queued');
+    expect(view.request).toEqual({ loginId: 'demo01', accountNo: '000-11-222333', from: '2026-09-01 00:00:00', to: '2026-09-30 23:59:59' });
+  });
+
+  it('NO_PROGRESS로 실패한 작업은 kind NO_PROGRESS이고, 도중에 쓰인 결과 행을 보이지 않는다', async () => {
+    const { app, redis, queue, startWorker } = await makeLab();
+    startWorker(async (job) => {
+      // 이어받는 동안 앞 페이지의 행은 이미 결과 저장소에 있다. 작업은 끝내 실패한다.
+      await redis.hset(resultsKey(queue.name, job.id as string), { '1': JSON.stringify(row(1)) });
+      throw new UnrecoverableError(formatFailedReason('NO_PROGRESS', '큐 전체에서 속도 제한·차단 주기 3번 연속 새 페이지 없음'));
+    });
+    const { id } = (await post(app, BODY)).json();
+    const failed = (await waitForStatus(app, id, 'failed')).json();
+    expect(failed.failure).toEqual({ kind: 'NO_PROGRESS', detail: '큐 전체에서 속도 제한·차단 주기 3번 연속 새 페이지 없음' });
+    expect(failed.result).toBeUndefined();
+    expect(await redis.hlen(resultsKey(queue.name, id))).toBe(1);
+  });
+
   /**
    * TROUBLESHOOTING 3번의 회귀 테스트. 상태를 처리중으로 읽은 뒤, 작업을 읽기 전에 작업을
    * 실패시킨다. 상태를 먼저 읽는 지금 순서면 처리중으로 답한다. 작업을 먼저 읽는 옛 순서로
