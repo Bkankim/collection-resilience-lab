@@ -29,6 +29,7 @@ import {
   formatFailedReason,
   parseFailedReason,
   progressKey,
+  requestOf,
   resultsKey,
 } from '../queue.js';
 import type { CapturedRaw, CollectionJobData, DeadLetterData, DeadLetterKind } from '../queue.js';
@@ -251,10 +252,7 @@ export function createCollectionHandlers(deps: ProcessorDeps): CollectionHandler
     }
     if (checkpoint === undefined || checkpoint.nextPage <= 1) {
       await redis.del(key);
-      if (data.checkpoint !== undefined) {
-        const { checkpoint: _dropped, ...request } = data;
-        await job.updateData(request);
-      }
+      if (data.checkpoint !== undefined) await job.updateData(requestOf(data));
     }
 
     let result: CollectResult;
@@ -443,7 +441,7 @@ export function createCollectionHandlers(deps: ProcessorDeps): CollectionHandler
       detail,
       attemptsMade: job.attemptsMade + 1,
       failedAt: new Date(clock()).toISOString(),
-      request: job.data,
+      request: requestOf(job.data),
       raw: raw === undefined ? null : capture(redactForCapture(raw)),
     };
     if (!(await writeDead(entry))) unwritten.set(error, entry);
@@ -498,7 +496,7 @@ export function createCollectionHandlers(deps: ProcessorDeps): CollectionHandler
       detail: `BullMQ가 프로세서 밖에서 실패시켰다: ${reason}`,
       attemptsMade: job.attemptsMade,
       failedAt: new Date(clock()).toISOString(),
-      request: job.data,
+      request: requestOf(job.data),
       raw: null,
     });
   }

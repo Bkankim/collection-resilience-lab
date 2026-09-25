@@ -34,6 +34,18 @@ export type CollectionJobData = {
   checkpoint?: CollectionCheckpoint;
 };
 
+/** 요청 네 필드. 작업 데이터에서 워커 내부 상태(체크포인트)를 뺀 것이다. */
+export type CollectionRequest = Pick<CollectionJobData, 'loginId' | 'accountNo' | 'from' | 'to'>;
+
+/**
+ * 작업 데이터에서 요청 네 필드만 뽑는다. 밖으로 내보내는 자리(API 상태 응답, DLQ 항목)는 이것을 쓴다.
+ * 체크포인트를 그대로 실으면 API 응답 모양이 처리 중에 바뀌고, DLQ 항목의 request를 POST /collections에
+ * 그대로 다시 내면 "모르는 필드: checkpoint"로 400이다(#19 최종 리뷰 13).
+ */
+export function requestOf(data: CollectionJobData): CollectionRequest {
+  return { loginId: data.loginId, accountNo: data.accountNo, from: data.from, to: data.to };
+}
+
 /**
  * 이어받기 체크포인트(#19). 워커가 페이지를 받을 때마다 `job.updateData`로 남긴다.
  *
@@ -339,8 +351,8 @@ export type DeadLetterData = {
   attemptsMade: number;
   /** ISO 8601 UTC. */
   failedAt: string;
-  /** 작업 데이터 그대로다. 작업 데이터에는 비밀이 없다(위 `CollectionJobData`). */
-  request: CollectionJobData;
+  /** 요청 네 필드(`requestOf`). 작업 데이터에는 비밀이 없다(위 `CollectionJobData`). 체크포인트는 싣지 않는다. */
+  request: CollectionRequest;
   /** PARSE_FAILED·UNKNOWN에만 있다. **`redactForCapture`를 거친 값**이다. */
   raw: CapturedRaw | null;
 };

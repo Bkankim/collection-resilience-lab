@@ -948,6 +948,34 @@ suite('큐 워커: 이어받기와 진행 기반 상한(#19)', () => {
     expect(lab.events.some((e) => e.event === 'resume-reset')).toBe(false);
   });
 
+  it('DLQ의 request는 요청 네 필드뿐이고 워커의 체크포인트를 싣지 않는다(처분이 쓴 항목)', { timeout: TIMEOUT }, async () => {
+    const lab = await makeLab();
+    const row: Transaction = { seq: 1, at: '2026-01-02 01:00:00', memo: '급여', withdrawal: 0, deposit: 1000, balance: 1000 };
+    // 매 시도 1페이지를 받고(체크포인트가 생긴다) TRANSIENT. 세 번째 시도 뒤 DLQ.
+    await lab.startWorker('w1', async (_data, options) => {
+      await options.onPage?.([row], options.startPage ?? 1);
+      return { ok: false, kind: 'TRANSIENT', detail: 'HTTP 503' };
+    });
+    const id = await lab.add(DEMO01, ALL.from, ALL.to, { backoff: { type: 'fixed', delay: 20 } });
+    expect(await lab.waitFinished([id])).toEqual({ [id]: 'failed' });
+    expect((await lab.queue.getJob(id))?.data).toHaveProperty('checkpoint');
+    const dead = (await lab.deadLetter.getJob(id))?.data;
+    expect(dead?.kind).toBe('TRANSIENT');
+    expect(dead?.request).toEqual({ loginId: 'demo01', accountNo: '000-11-222333', from: ALL.from, to: ALL.to });
+  });
+
+  it('DLQ의 request는 요청 네 필드뿐이다(BullMQ가 프로세서 밖에서 실패시킨 항목)', { timeout: TIMEOUT }, async () => {
+    const lab = await makeLab();
+    const id = await lab.add(DEMO01, ALL.from, ALL.to);
+    const job = await lab.queue.getJob(id);
+    await job?.updateData({ ...(job.data as CollectionJobData), checkpoint: { nextPage: 4, rows: 60 } });
+    await lab.redis.hset(`bull:${lab.queue.name}:${id}`, 'defa', 'job stalled more than allowable limit');
+    await lab.startWorker('w1', async () => ({ ok: true, rows: [], pages: 1 }));
+    expect(await lab.waitFinished([id])).toEqual({ [id]: 'failed' });
+    await waitUntil(() => lab.events.some((e) => e.event === 'dead-letter'));
+    expect((await lab.deadLetter.getJob(id))?.data.request).toEqual({ loginId: 'demo01', accountNo: '000-11-222333', from: ALL.from, to: ALL.to });
+  });
+
   it('페이지 저장(onPage) 중의 RangeError는 설정 오류가 아니라 일반 오류라 재시도한다', { timeout: TIMEOUT }, async () => {
     const lab = await makeLab();
     let hsets = 0;
