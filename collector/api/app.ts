@@ -51,7 +51,8 @@ export type CollectionStatus = 'queued' | 'running' | 'completed' | 'failed';
 export type CollectionView = {
   id: string;
   status: CollectionStatus;
-  request: CollectionJobData;
+  /** 요청 네 필드만. 워커가 작업 데이터에 남기는 체크포인트(#19)는 싣지 않는다. */
+  request: Pick<CollectionJobData, 'loginId' | 'accountNo' | 'from' | 'to'>;
   /** 지금까지 시도 횟수를 깎은 실패 수. 재시도 대기 중이면 0보다 크다. */
   attemptsMade: number;
   result?: { count: number; rows: Transaction[] };
@@ -153,10 +154,13 @@ export function buildApi(options: BuildApiOptions): FastifyInstance {
   });
 
   async function view(job: Job<CollectionJobData>, status: CollectionStatus): Promise<CollectionView> {
+    // 작업 데이터를 그대로 싣지 않는다. 워커가 페이지마다 체크포인트를 더하므로(#19), 그대로
+    // 실으면 처리 중에 응답 모양이 바뀌고 워커 내부 상태가 호출하는 쪽에 드러난다.
+    const { loginId, accountNo, from, to } = job.data;
     const base: CollectionView = {
       id: job.id as string,
       status,
-      request: job.data,
+      request: { loginId, accountNo, from, to },
       attemptsMade: job.attemptsMade,
     };
     if (status === 'completed') {

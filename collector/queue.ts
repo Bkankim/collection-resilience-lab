@@ -30,6 +30,21 @@ export type CollectionJobData = {
   accountNo: string;
   from: string;
   to: string;
+  /** 워커만 쓴다. 요청에는 없고, API 응답(`request`)에도 싣지 않는다. */
+  checkpoint?: CollectionCheckpoint;
+};
+
+/**
+ * 이어받기 체크포인트(#19). 워커가 페이지를 받을 때마다 `job.updateData`로 남긴다.
+ *
+ * 속도 제한·출발지 차단 창보다 큰 작업(demo01 요청 10개 > N=5)은 매 주기 로그인부터 다시
+ * 하면 영영 끝나지 않는다(TROUBLESHOOTING 4번). 받은 페이지의 행은 결과 저장소에 이미 있으므로
+ * 다음 페이지 번호만 남기면 다시 시작한 쪽이 거기서 잇는다. 결과 해시가 seq 필드라 같은
+ * 페이지를 다시 받아 써도 행이 늘지 않는다(`resultsKey`).
+ */
+export type CollectionCheckpoint = {
+  /** 다시 시작할 때 받을 페이지. 이 앞 페이지의 행은 결과 저장소에 이미 있다. */
+  nextPage: number;
 };
 
 /**

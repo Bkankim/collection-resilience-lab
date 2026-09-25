@@ -51,7 +51,7 @@ const worker = createCollectionWorker({
   concurrency,
   limiter,
   deps: {
-    collect: (data) => collect({ transport, clock: systemClock }, data.loginId, data.accountNo, data.from, data.to),
+    collect: (data, options) => collect({ transport, clock: systemClock }, data.loginId, data.accountNo, data.from, data.to, options),
     redis,
     queue,
     deadLetter,

@@ -28,7 +28,7 @@ import type { Failure } from '../client/classify.js';
 import { systemClock } from '../client/clock.js';
 import type { Transaction } from '../client/parse.js';
 import { collect } from '../client/session.js';
-import type { CollectResult } from '../client/session.js';
+import type { CollectOptions, CollectResult } from '../client/session.js';
 import { createUndiciTransport } from '../client/transport.js';
 import type { Transport } from '../client/transport.js';
 import {
@@ -39,6 +39,7 @@ import {
   deadLetterQueueName,
   jobIdOf,
   parseFailedReason,
+  readResults,
   resultsKey,
 } from '../queue.js';
 import type { CollectionJobData, DeadLetterData } from '../queue.js';
@@ -58,7 +59,7 @@ afterEach(async () => {
   for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
 });
 
-type Hit = { t: number; method: string; path: string; status: number };
+type Hit = { t: number; method: string; path: string; status: number; page?: number };
 
 /** 대상 서버를 빈 포트에 띄운다. 관리 API는 요청 기록에서 뺀다(차단 판정도 받지 않는다). */
 async function startTarget() {
@@ -67,7 +68,8 @@ async function startTarget() {
   app.addHook('onResponse', async (request, reply) => {
     const path = request.url.split('?')[0] ?? request.url;
     if (path.startsWith('/admin')) return;
-    hits.push({ t: Date.now(), method: request.method, path, status: reply.statusCode });
+    const page = /[?&]page=(\d+)/.exec(request.url)?.[1];
+    hits.push({ t: Date.now(), method: request.method, path, status: reply.statusCode, ...(page === undefined ? {} : { page: Number(page) }) });
   });
   await app.listen({ port: 0, host: '127.0.0.1' });
   cleanups.push(() => app.close());
@@ -114,7 +116,7 @@ async function makeLab() {
     deadLetter,
     events,
     /** 진입점과 같은 조립으로 워커를 띄운다. `limiter`도 진입점 기본값 그대로다. */
-    async startWorker(workerName: string, collectFn: (data: CollectionJobData) => Promise<CollectResult>) {
+    async startWorker(workerName: string, collectFn: (data: CollectionJobData, options: CollectOptions) => Promise<CollectResult>) {
       const connection = createRedis('worker', url);
       connections.push(connection);
       const worker = createCollectionWorker({
@@ -154,8 +156,8 @@ async function makeLab() {
 
 function realCollect(origin: string, env?: Record<string, string | undefined>) {
   const transport = createUndiciTransport({ origin });
-  return (data: CollectionJobData) =>
-    collect({ transport, clock: systemClock, ...(env === undefined ? {} : { env }) }, data.loginId, data.accountNo, data.from, data.to);
+  return (data: CollectionJobData, options: CollectOptions) =>
+    collect({ transport, clock: systemClock, ...(env === undefined ? {} : { env }) }, data.loginId, data.accountNo, data.from, data.to, options);
 }
 
 function expectedRows(demo: Demo, from: string, to: string): number {
@@ -612,6 +614,34 @@ suite('큐 워커: 멱등과 분배', () => {
     expect(byWorker.w1 + byWorker.w2).toBe(20);
     expect(byWorker.w1).toBeGreaterThan(0);
     expect(byWorker.w2).toBeGreaterThan(0);
+    expect(await lab.deadLetter.count()).toBe(0);
+  });
+});
+
+/** 대상 서버가 받은 거래내역 요청을 `페이지(상태)` 모양으로. 429·403만 상태를 붙인다. */
+function pageTrace(hits: Hit[]): string[] {
+  return hits.filter((h) => h.path === '/transactions').map((h) => (h.status === 200 ? String(h.page) : `${h.page}(${h.status})`));
+}
+
+suite('큐 워커: 이어받기와 진행 기반 상한(#19)', () => {
+  const ALL = { from: '2026-01-01 00:00:00', to: '2026-12-31 23:59:59' };
+
+  it('대상 서버 기본 임계값(W=10초, N=5)에서 속도 제한을 켜도 demo01 전체 작업이 받은 페이지부터 이어 가며 완료되고 결과가 원장과 같다', { timeout: 45_000 }, async () => {
+    const target = await startTarget();
+    await target.configure({ switches: { rateLimit: true }, thresholds: { windowSec: 10, maxRequests: 5 } });
+    const lab = await makeLab();
+    await lab.startWorker('w1', realCollect(target.origin));
+    const id = await lab.add(DEMO01, ALL.from, ALL.to);
+    expect(await lab.waitFinished([id], 40_000)).toEqual({ [id]: 'completed' });
+
+    // 137행 = 7페이지 + 끝을 확인하는 빈 8페이지. 주기마다 로그인 2 + 페이지 3개가 창(5)을 채우고
+    // 다음 페이지에서 429다. 예전에는 매 주기 1페이지부터 다시 받아 4페이지에서 끝없이 막혔다.
+    expect(pageTrace(target.hits)).toEqual(['1', '2', '3', '4(429)', '4', '5', '6', '7(429)', '7', '8']);
+    expect(target.hits.filter((h) => h.path === '/login')).toHaveLength(3);
+    expect(await readResults(lab.redis, lab.queue.name, id)).toEqual(buildLedger(DEMO01.accountNo, DEMO01.count));
+    expect(((await lab.queue.getJob(id))?.returnvalue as ProcessorResult).count).toBe(137);
+    const limited = lab.events.filter((e) => e.event === 'rate-limited');
+    expect(limited.map((e) => e.attemptsMade)).toEqual([0, 0]);
     expect(await lab.deadLetter.count()).toBe(0);
   });
 });

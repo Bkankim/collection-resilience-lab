@@ -20,7 +20,7 @@ import type { ClassifyInput, Failure } from '../client/classify.js';
 import { DEFAULT_RATE_LIMIT_WAIT_SEC } from '../client/classify.js';
 import type { Clock } from '../client/clock.js';
 import type { FailureKind } from '../client/errors.js';
-import type { CollectResult } from '../client/session.js';
+import type { CollectOptions, CollectResult } from '../client/session.js';
 import {
   DISPOSITION,
   authBlockKey,
@@ -42,8 +42,12 @@ export type WorkerEvent =
   | { event: 'auth-blocked'; jobId: string; loginId: string };
 
 export type ProcessorDeps = {
-  /** 수집 함수. 기본 조립은 `session.ts`의 `collect`에 undici 전송을 붙인 것(`index.ts`). */
-  collect: (data: CollectionJobData) => Promise<CollectResult>;
+  /**
+   * 수집 함수. 기본 조립은 `session.ts`의 `collect`에 undici 전송을 붙인 것(`index.ts`).
+   * `options`는 이어받기(#19)다. 시작 페이지와, 페이지마다 결과·체크포인트를 쓰는 `onPage`를
+   * 넘긴다. 무시하는 수집 함수(테스트의 가짜)는 처음부터 다 받아 돌려주면 된다.
+   */
+  collect: (data: CollectionJobData, options: CollectOptions) => Promise<CollectResult>;
   /** 결과 저장소와 차단기를 읽고 쓰는 연결. */
   redis: Redis;
   /** 원래 큐. 이름으로 결과 키를 만들고, `rateLimit`으로 큐 전체를 멈춘다. */
@@ -133,7 +137,16 @@ export function createCollectionHandlers(deps: ProcessorDeps): CollectionHandler
 
     let result: CollectResult;
     try {
-      result = await deps.collect(data);
+      result = await deps.collect(data, {
+        startPage: data.checkpoint?.nextPage ?? 1,
+        onPage: async (rows, page) => {
+          // **행을 먼저, 체크포인트를 나중에 쓴다.** 둘 사이에 워커가 죽으면 다시 시작한 쪽이
+          // 같은 페이지를 한 번 더 받아 같은 seq에 덮어쓸 뿐이다. 반대 순서면 체크포인트만
+          // 넘어가고 그 페이지의 행이 영영 빠진다.
+          await writeResults(jobId, rows);
+          await job.updateData({ ...job.data, checkpoint: { nextPage: page + 1 } });
+        },
+      });
     } catch (error) {
       // `collect`가 던지는 것은 자격증명 없음·공유키 형식 오류·기간 형식 오류(RangeError)다.
       // 수집 실패가 아니라 배치 설정이나 호출하는 쪽의 버그라서 일곱 종 어디에도 맞지 않고,
@@ -146,9 +159,13 @@ export function createCollectionHandlers(deps: ProcessorDeps): CollectionHandler
     }
 
     if (result.ok) {
+      // `onPage`를 부르지 않는 수집 함수도 있어 한 번 더 쓴다. seq 필드라 늘지 않는다.
       await writeResults(jobId, result.rows);
-      log({ event: 'completed', jobId, attemptsMade: job.attemptsMade, rows: result.rows.length });
-      return { count: result.rows.length };
+      // 건수는 이번 실행이 받은 행이 아니라 저장소 전체다. 이어받았으면 앞 주기에 쓴 행이
+      // 이번 `result.rows`에 없다.
+      const count = await redis.hlen(resultsKey(queue.name, jobId));
+      log({ event: 'completed', jobId, attemptsMade: job.attemptsMade, rows: count });
+      return { count };
     }
     return dispose(job, jobId, result);
   }
