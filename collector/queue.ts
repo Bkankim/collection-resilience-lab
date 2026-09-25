@@ -272,7 +272,8 @@ export function parseFailedReason(reason: string | undefined): RecordedFailure {
  *   됐다(#13 리뷰 r3 재현). 실패 작업은 지우지 않고 작업 ID가 같으면 새로 만들지 않으므로,
  *   차단이 풀린 뒤 같은 요청을 다시 넣어도 failed로 남는다. 큐 전체를 Retry-After만큼 멈추면
  *   시도 횟수를 깎지 않는다는 `CONSUMES_ATTEMPT.IP_BLOCKED`(false)와도 맞는다. 다만 차단이
- *   풀리자마자 다시 막히면 속도 제한과 같은 끝나지 않는 반복이 된다(TROUBLESHOOTING 4번).
+ *   풀리자마자 다시 막히면 속도 제한과 같은 끝나지 않는 반복이 됐다(TROUBLESHOOTING 4번). #19 뒤로는
+ *   받은 페이지부터 이어받고, 큐 전체가 나아가지 못하면 진행 기반 상한이 NO_PROGRESS로 끊는다.
  *   #14에서 출발지 전환(ROTATE_EGRESS)이 들어오면 이 칸이 바뀐다.
  * - SESSION_EXPIRED: 정상 흐름에서는 밖으로 나오지 않는다. `collect` 안에서 재인증하고 그
  *   페이지를 한 번 다시 보내며, 재인증 직후 또 세션 실패면 UNKNOWN으로 올려 내보낸다
