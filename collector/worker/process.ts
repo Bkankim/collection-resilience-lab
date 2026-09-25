@@ -41,6 +41,7 @@ export type WorkerEvent =
   | { event: 'dead-letter'; jobId: string; attemptsMade: number; kind: DeadLetterKind | null; detail: string }
   | { event: 'dead-letter-error'; jobId: string; detail: string }
   | { event: 'progress-count-error'; jobId: string; detail: string }
+  | { event: 'resume-reset'; jobId: string; detail: string }
   | { event: 'auth-block-error'; jobId: string; detail: string }
   | { event: 'auth-blocked'; jobId: string; loginId: string };
 
@@ -228,10 +229,30 @@ export function createCollectionHandlers(deps: ProcessorDeps): CollectionHandler
       throw await recordDead(new UnrecoverableError(formatFailedReason(kind, detail)), job, jobId, kind, detail);
     }
 
+    // 결과 저장소의 수명 규칙(#19 최종 리뷰 1·12). 1페이지부터 받는 실행은 같은 작업 ID의 옛 결과를
+    // 먼저 지운다. 남겨 두면 작업을 지우고 다시 넣었을 때 옛 실행의 행이 건수와 결과에 섞인다. 이어받는
+    // 실행은 앞 페이지의 행이 아직 있는지(`checkpoint.rows`) 본다. 모자라면 1페이지부터 다시 받는다.
+    const key = resultsKey(queue.name, jobId);
+    let checkpoint = data.checkpoint;
+    if (checkpoint !== undefined && checkpoint.nextPage > 1) {
+      const have = await redis.hlen(key);
+      if (have < (checkpoint.rows ?? 0)) {
+        log({ event: 'resume-reset', jobId, detail: `결과 ${have}행 < 체크포인트 ${checkpoint.rows}행(${checkpoint.nextPage}페이지). 1페이지부터 다시 받는다` });
+        checkpoint = undefined;
+      }
+    }
+    if (checkpoint === undefined || checkpoint.nextPage <= 1) {
+      await redis.del(key);
+      if (data.checkpoint !== undefined) {
+        const { checkpoint: _dropped, ...request } = data;
+        await job.updateData(request);
+      }
+    }
+
     let result: CollectResult;
     try {
-      result = await deps.collect(data, {
-        startPage: data.checkpoint?.nextPage ?? 1,
+      result = await deps.collect(job.data, {
+        startPage: checkpoint?.nextPage ?? 1,
         onPage: async (rows, page) => {
           // 진행은 **받자마자** 센다. 결과·체크포인트 쓰기(두 번 왕복) 뒤에 세면 그 사이 다른 워커가
           // 받은 429가 먼저 주기를 세어, 이미 받은 페이지를 다음 주기로 넘긴다(#19 리뷰 1b). 쓰기 전에
@@ -241,7 +262,8 @@ export function createCollectionHandlers(deps: ProcessorDeps): CollectionHandler
           // 같은 페이지를 한 번 더 받아 같은 seq에 덮어쓸 뿐이다. 반대 순서면 체크포인트만
           // 넘어가고 그 페이지의 행이 영영 빠진다.
           await writeResults(jobId, rows);
-          await job.updateData({ ...job.data, checkpoint: { nextPage: page + 1 } });
+          const written = await redis.hlen(key);
+          await job.updateData({ ...job.data, checkpoint: { nextPage: page + 1, rows: written } });
         },
       });
     } catch (error) {

@@ -900,6 +900,75 @@ suite('큐 워커: 이어받기와 진행 기반 상한(#19)', () => {
     expect((starts[1] as number) - (starts[0] as number)).toBeGreaterThanOrEqual(450);
   });
 
+  it('체크포인트가 있는 실패 작업의 결과 키가 지워진 뒤 다시 돌리면, 앞 페이지부터 다시 받아 원장 전체로 완료한다', { timeout: TIMEOUT }, async () => {
+    const lab = await makeLab();
+    const ledger = buildLedger(DEMO01.accountNo, DEMO01.count);
+    let calls = 0;
+    // 세션처럼 startPage부터 20행씩 onPage로 넘긴다. 첫 호출은 3페이지까지 받고 UNKNOWN으로 실패한다.
+    await lab.startWorker('w1', async (_data, options) => {
+      calls += 1;
+      const rows: Transaction[] = [];
+      for (let page = options.startPage ?? 1; ; page += 1) {
+        const pageRows = ledger.slice((page - 1) * 20, page * 20);
+        if (pageRows.length === 0) return { ok: true, rows, pages: page };
+        if (calls === 1 && page === 4) {
+          return { ok: false, kind: 'UNKNOWN', detail: '응답 구조 변경', raw: { status: 200, headers: {}, body: Buffer.from('?') } };
+        }
+        rows.push(...pageRows);
+        await options.onPage?.(pageRows, page);
+      }
+    });
+    const id = await lab.add(DEMO01, ALL.from, ALL.to);
+    expect(await lab.waitFinished([id])).toEqual({ [id]: 'failed' });
+    expect(await lab.redis.hlen(resultsKey(lab.queue.name, id))).toBe(60);
+    // 사람이 결과 키를 지우고(실패 작업 정리) 작업을 다시 돌린다.
+    await lab.redis.del(resultsKey(lab.queue.name, id));
+    await (await lab.queue.getJob(id))?.retry('failed');
+    await waitUntil(() => lab.events.filter((e) => e.event === 'completed').length === 1);
+    expect(await lab.waitFinished([id])).toEqual({ [id]: 'completed' });
+
+    expect(await readResults(lab.redis, lab.queue.name, id)).toEqual(ledger);
+    expect(((await lab.queue.getJob(id))?.returnvalue as ProcessorResult).count).toBe(137);
+  });
+
+  it('앞 페이지가 기간으로 전부 걸러져 결과 키가 없어도, 이어받기는 체크포인트 페이지부터다(처음으로 되돌리지 않는다)', { timeout: TIMEOUT }, async () => {
+    const lab = await makeLab();
+    const starts: number[] = [];
+    await lab.startWorker('w1', async (_data, options) => {
+      const start = options.startPage ?? 1;
+      starts.push(start);
+      // 1~3페이지는 기간 밖이라 0행. 첫 호출은 4페이지에서 429.
+      for (let page = start; page <= 3; page += 1) await options.onPage?.([], page);
+      if (starts.length === 1) return { ok: false, kind: 'RATE_LIMITED', detail: 'HTTP 429', retryAfterSec: 0.1 };
+      return { ok: true, rows: [], pages: 5 };
+    });
+    const id = await lab.add(DEMO01, ALL.from, ALL.to);
+    expect(await lab.waitFinished([id])).toEqual({ [id]: 'completed' });
+    expect(starts).toEqual([1, 4]);
+    expect(lab.events.some((e) => e.event === 'resume-reset')).toBe(false);
+  });
+
+  it('작업을 지우고 결과 키를 남긴 채 다시 넣으면, 건수와 결과는 새 실행의 행뿐이다', { timeout: TIMEOUT }, async () => {
+    const lab = await makeLab();
+    const mk = (seq: number): Transaction => ({ seq, at: `2026-01-0${seq % 9 + 1} 01:00:00`, memo: 'x', withdrawal: 0, deposit: seq, balance: seq });
+    let calls = 0;
+    await lab.startWorker('w1', async () => {
+      calls += 1;
+      return { ok: true, rows: calls === 1 ? [mk(1), mk(2), mk(3)] : [mk(10), mk(11)], pages: 2 };
+    });
+    const id = await lab.add(DEMO01, ALL.from, ALL.to);
+    await lab.waitFinished([id]);
+    expect(await lab.redis.hlen(resultsKey(lab.queue.name, id))).toBe(3);
+
+    await (await lab.queue.getJob(id))?.remove(); // 결과 키는 남는다
+    await lab.add(DEMO01, ALL.from, ALL.to);
+    await waitUntil(() => lab.events.filter((e) => e.event === 'completed').length === 2);
+    await lab.waitFinished([id]);
+
+    expect(((await lab.queue.getJob(id))?.returnvalue as ProcessorResult).count).toBe(2);
+    expect((await readResults(lab.redis, lab.queue.name, id)).map((r) => r.seq)).toEqual([10, 11]);
+  });
+
   // 이어받는 실행이 4페이지를 받고 결과를 쓰는 자리에서 워커가 죽는다. 'after'는 행을 쓴 뒤·체크포인트
   // 전(같은 페이지를 다시 쓰게 된다), 'before'는 행을 쓰기 전(체크포인트가 행보다 먼저면 그 페이지가
   // 빠진다). 죽음은 결과 쓰기를 영영 돌아오지 않게 하고 워커를 강제로 닫아 만든다. 잠금이 풀리면
