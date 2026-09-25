@@ -632,6 +632,16 @@ suite('큐 워커: 멱등과 분배', () => {
   });
 });
 
+/**
+ * Redis 서버 시각(ms). 진행 키의 `until`은 COUNT_CYCLE이 Redis `TIME`과 비교하므로 심는 값도 같은 시계에서
+ * 가져온다. 호스트 시계로 심으면 Redis가 도는 VM(colima)의 시계가 어긋날 때 "직전 정지가 막 끝났다"는 뜻이
+ * 조용히 바뀐다(#19 최종 리뷰 15).
+ */
+async function redisNow(redis: Redis): Promise<number> {
+  const [sec, usec] = await redis.time();
+  return Number(sec) * 1000 + Math.floor(Number(usec) / 1000);
+}
+
 /** 대상 서버가 받은 거래내역 요청을 `페이지(상태)` 모양으로. 429·403만 상태를 붙인다. */
 function pageTrace(hits: Hit[]): string[] {
   return hits.filter((h) => h.path === '/transactions').map((h) => (h.status === 200 ? String(h.page) : `${h.page}(${h.status})`));
@@ -703,14 +713,23 @@ suite('큐 워커: 이어받기와 진행 기반 상한(#19)', () => {
     const LATE = { from: '2026-01-02 00:00:00', to: ALL.to };
     const lateStarts: number[] = [];
     const real = realCollect(target.origin);
-    // 늦은 작업은 0.1초 늦게 출발한다. 두 작업이 같은 주기에 출발하면 이른 작업이 창(로그인 2 +
-    // 페이지 3)을 먼저 다 쓰고, 늦은 작업은 로그인에서 429·403을 받는다. 경쟁을 고정해서 늦은
-    // 작업이 처음 세 주기를 한 페이지도 없이 지나게 한다(작업 단위로 세면 여기서 NO_PROGRESS다).
+    // 늦은 작업의 i번째 호출은 이른 작업의 i번째 호출이 끝난 뒤(또는 이른 작업이 완료된 뒤)에 출발한다.
+    // 이른 작업이 그 주기의 창(로그인 2 + 페이지 3, 마지막 주기는 로그인 2 + 7·8페이지)을 먼저 다 쓰고,
+    // 늦은 작업은 로그인·2차 인증에서 429·403을 받는다. 늦은 작업이 처음 세 주기를 한 페이지도 없이 지나게
+    // 경쟁을 고정한다(작업 단위로 세면 여기서 NO_PROGRESS다). 예전에는 0.1초 늦게 출발시켰는데, 부하로 이른
+    // 작업의 요청 다섯 개가 0.1초를 넘기면 순서가 뒤집힌다(#19 최종 리뷰 S2).
+    let earlyDone = 0;
+    let earlyCompleted = false;
     const collectFn = async (data: CollectionJobData, options: CollectOptions) => {
-      if (data.from === LATE.from) {
-        lateStarts.push(options.startPage ?? 1);
-        await sleep(100);
+      if (data.from !== LATE.from) {
+        const result = await real(data, options);
+        earlyDone += 1;
+        if (result.ok) earlyCompleted = true;
+        return result;
       }
+      lateStarts.push(options.startPage ?? 1);
+      const call = lateStarts.length;
+      await waitUntil(() => earlyDone >= call || earlyCompleted, 30_000);
       return real(data, options);
     };
     await lab.startWorker('w1', collectFn);
@@ -766,7 +785,7 @@ suite('큐 워커: 이어받기와 진행 기반 상한(#19)', () => {
   it('다른 워커가 받은 페이지는 그 결과를 쓰기 전에도 진행으로 센다', { timeout: TIMEOUT }, async () => {
     const lab = await makeLab();
     // 직전까지 연속 2(K=3). 이번 주기에 아무도 못 받았으면 NO_PROGRESS가 맞다.
-    await lab.redis.hset(progressKey(lab.queue.name), { pages: 0, seen: 0, cycles: 2, until: Date.now() });
+    await lab.redis.hset(progressKey(lab.queue.name), { pages: 0, seen: 0, cycles: 2, until: await redisNow(lab.redis) });
     // 페이지를 받은 워커의 결과 쓰기(HSET)가 0.3초 걸린다. 그 사이 다른 워커가 429를 받는다.
     const slow = new Proxy(lab.redis, {
       get(obj, prop) {
@@ -808,7 +827,7 @@ suite('큐 워커: 이어받기와 진행 기반 상한(#19)', () => {
 
   it('같은 주기 안에서도 앞선 제한 뒤에 받은 페이지가 있으면 진행으로 센다', { timeout: TIMEOUT }, async () => {
     const lab = await makeLab();
-    await lab.redis.hset(progressKey(lab.queue.name), { pages: 0, seen: 0, cycles: 2, until: Date.now() });
+    await lab.redis.hset(progressKey(lab.queue.name), { pages: 0, seen: 0, cycles: 2, until: await redisNow(lab.redis) });
     const row: Transaction = { seq: 1, at: '2026-01-02 01:00:00', memo: '급여', withdrawal: 0, deposit: 1000, balance: 1000 };
     const FIRST = '2026-01-02 00:00:00';
     let bCalls = 0;
