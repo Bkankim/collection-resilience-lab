@@ -948,6 +948,38 @@ suite('큐 워커: 이어받기와 진행 기반 상한(#19)', () => {
     expect(lab.events.some((e) => e.event === 'resume-reset')).toBe(false);
   });
 
+  it('페이지 저장(onPage) 중의 RangeError는 설정 오류가 아니라 일반 오류라 재시도한다', { timeout: TIMEOUT }, async () => {
+    const lab = await makeLab();
+    let hsets = 0;
+    const flaky = new Proxy(lab.redis, {
+      get(obj, prop) {
+        if (prop === 'hset') {
+          return async (...args: unknown[]) => {
+            hsets += 1;
+            if (hsets === 1) throw new RangeError('Invalid string length');
+            return (obj.hset as (...a: unknown[]) => Promise<number>)(...args);
+          };
+        }
+        const value = Reflect.get(obj, prop, obj) as unknown;
+        return typeof value === 'function' ? (value as (...a: unknown[]) => unknown).bind(obj) : value;
+      },
+    });
+    const row: Transaction = { seq: 1, at: '2026-01-02 01:00:00', memo: '급여', withdrawal: 0, deposit: 1000, balance: 1000 };
+    await lab.startWorker(
+      'w1',
+      async (_data, options) => {
+        await options.onPage?.([row], 1);
+        return { ok: true, rows: [row], pages: 2 };
+      },
+      { redis: flaky },
+    );
+    const id = await lab.add(DEMO01, ALL.from, ALL.to, { backoff: { type: 'fixed', delay: 20 } });
+    expect(await lab.waitFinished([id])).toEqual({ [id]: 'completed' });
+    expect(lab.events.filter((e) => e.event === 'retry').map((e) => e.detail)).toEqual([expect.stringContaining('Invalid string length')]);
+    expect(await lab.deadLetter.count()).toBe(0);
+    expect(await lab.redis.hlen(resultsKey(lab.queue.name, id))).toBe(1);
+  });
+
   it('진행 기반 상한 K는 2 이상의 정수여야 하고, 아니면 워커를 만들 때 던진다', async () => {
     const lab = await makeLab();
     const connection = createRedis('worker', REDIS_URL as string);

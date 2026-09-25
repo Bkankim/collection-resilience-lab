@@ -156,6 +156,9 @@ export type ProcessorResult = { count: number };
 /** `retry` 처분의 오류. 표 바깥의 예외와 구분해 바깥 catch가 DLQ를 두 번 쓰지 않게 한다. */
 class DispositionError extends Error {}
 
+/** `onPage`의 결과·체크포인트 저장 오류. 수집 함수 밖의 설정 오류(`RangeError`)와 가른다. */
+class PersistenceError extends Error {}
+
 /** 차단기 키에 남기는 값. 뒤따르는 작업이 무엇 때문에 막혔는지 DLQ에 옮겨 적는다. */
 type AuthBlock = { jobId: string; kind: FailureKind; detail: string; at: string };
 
@@ -260,17 +263,23 @@ export function createCollectionHandlers(deps: ProcessorDeps): CollectionHandler
         startPage: checkpoint?.nextPage ?? 1,
         ...(checkpoint?.maxPage === undefined ? {} : { maxPage: checkpoint.maxPage }),
         onPage: async (rows, page, maxPage) => {
-          // 진행은 **받자마자** 센다. 결과·체크포인트 쓰기(두 번 왕복) 뒤에 세면 그 사이 다른 워커가
-          // 받은 429가 먼저 주기를 세어, 이미 받은 페이지를 다음 주기로 넘긴다(#19 리뷰 1b). 쓰기 전에
-          // 죽어도 진행이 한 번 더 세어질 뿐이고, 그것은 상한을 늦출 뿐 행을 만들지 않는다.
-          await creditProgress();
-          // **행을 먼저, 체크포인트를 나중에 쓴다.** 둘 사이에 워커가 죽으면 다시 시작한 쪽이
-          // 같은 페이지를 한 번 더 받아 같은 seq에 덮어쓸 뿐이다. 반대 순서면 체크포인트만
-          // 넘어가고 그 페이지의 행이 영영 빠진다.
-          await writeResults(jobId, rows);
-          const written = await redis.hlen(key);
-          const cap = maxPage ?? checkpoint?.maxPage;
-          await job.updateData({ ...job.data, checkpoint: { nextPage: page + 1, rows: written, ...(cap === undefined ? {} : { maxPage: cap }) } });
+          try {
+            // 진행은 **받자마자** 센다. 결과·체크포인트 쓰기(두 번 왕복) 뒤에 세면 그 사이 다른 워커가
+            // 받은 429가 먼저 주기를 세어, 이미 받은 페이지를 다음 주기로 넘긴다(#19 리뷰 1b). 쓰기 전에
+            // 죽어도 진행이 한 번 더 세어질 뿐이고, 그것은 상한을 늦출 뿐 행을 만들지 않는다.
+            await creditProgress();
+            // **행을 먼저, 체크포인트를 나중에 쓴다.** 둘 사이에 워커가 죽으면 다시 시작한 쪽이
+            // 같은 페이지를 한 번 더 받아 같은 seq에 덮어쓸 뿐이다. 반대 순서면 체크포인트만
+            // 넘어가고 그 페이지의 행이 영영 빠진다.
+            await writeResults(jobId, rows);
+            const written = await redis.hlen(key);
+            const cap = maxPage ?? checkpoint?.maxPage;
+            await job.updateData({ ...job.data, checkpoint: { nextPage: page + 1, rows: written, ...(cap === undefined ? {} : { maxPage: cap }) } });
+          } catch (error) {
+            // 저장 중의 오류는 표 바깥의 일반 오류다(재시도). 아래 catch의 RangeError(설정 오류) 가지로
+            // 새지 않게 감싼다(#19 최종 리뷰 9: ioredis·JSON이 RangeError를 던지면 '설정 오류'로 한 번에 DLQ였다).
+            throw new PersistenceError(error instanceof Error ? error.message : String(error), { cause: error });
+          }
         },
       });
     } catch (error) {
