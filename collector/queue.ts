@@ -216,7 +216,7 @@ export function formatFailedReason(kind: DeadLetterKind, detail: string): string
  * 최종 실패에 남는 종류. 분류기의 일곱 종에 워커가 붙이는 NO_PROGRESS 하나를 더한다.
  *
  * NO_PROGRESS(#19): 큐 전체가 속도 제한·출발지 차단 주기를 워커의 상한(기본 3)번 연달아 거치는
- * 동안 어느 작업도 새 페이지를 받지 못했을 때, 그 주기에 제한을 받은 작업이다(`progressKey`).
+ * 동안 어느 작업도 페이지를 받거나 완료하지 못했을 때, 그 주기에 제한을 받은 작업이다(`progressKey`).
  * 창(N)이 로그인 비용 이하면 영원히 한 페이지도 못 받는데, 속도 제한은 시도 횟수를 깎지 않아
  * (`CONSUMES_ATTEMPT`) 저절로 끝나지 않는다.
  *
@@ -357,18 +357,21 @@ export function authBlockKey(queueName: string, loginId: string): string {
 /**
  * 큐 전체의 진행 상태 키(#19 진행 기반 상한). Redis 해시 하나에 필드 넷이다.
  *
- * - `pages`: 이 큐의 어느 작업이든 페이지를 받을 때마다 1씩 오른다.
- * - `seen`: 직전 속도 제한·차단 주기를 셀 때의 `pages`.
- * - `cycles`: 큐 전체에서 새 페이지 없이 이어진 주기 수. NO_PROGRESS는 이것만 본다.
+ * - `pages`: 이 큐의 어느 작업이든 페이지를 받거나 완료할 때마다 1씩 오른다(이름과 달리 완료도 센다).
+ * - `seen`: 직전에 주기를 셀 때의 `pages`.
+ * - `cycles`: 큐 전체에서 진행 없이 이어진 주기 수. NO_PROGRESS는 이것만 본다.
  * - `until`: 직전 주기의 큐 정지가 끝나는 시각(Redis `TIME` 기준 ms). 이보다 이른 제한은 같은
- *   주기로 본다.
+ *   주기로 보고, 이보다 60초 넘게 늦은 제한은 연속이 끊긴 새 주기로 본다.
+ *
+ * 규칙 전체는 `worker/process.ts`의 `DEFAULT_NO_PROGRESS_CYCLES`·`COUNT_CYCLE` 주석에 있다.
  *
  * 작업마다 세지 않고 큐 전체로 세는 이유: 워커 2개가 같은 출발지로 동시에 출발하면 로그인 두 벌(4요청)이
  * 창(N=5)을 거의 다 써서 주기마다 한 작업만 한 페이지를 받는다. 작업마다 세면 경쟁에서 계속 진
  * 작업이 큐는 나아가는데도 NO_PROGRESS로 갔다(`docs/evidence/d3-resume.md`). 환경이 막혔는지는
  * 출발지, 곧 큐 전체의 성질이다.
  *
- * 만료를 두지 않는다. 필드 넷짜리 해시 하나이고, 만료로 사라지면 연속 횟수가 조용히 0이 된다.
+ * 키에 만료(TTL)를 두지 않고, 오래된 연속은 스크립트가 `until`을 보고 끊는다. 필드 넷짜리 해시
+ * 하나이고, 남겨 두면 사고가 끝난 뒤에도 마지막 상태를 읽을 수 있다.
  */
 export function progressKey(queueName: string): string {
   return `progress:${queueName}`;

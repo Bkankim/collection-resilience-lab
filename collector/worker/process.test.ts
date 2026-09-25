@@ -39,6 +39,7 @@ import {
   deadLetterQueueName,
   jobIdOf,
   parseFailedReason,
+  progressKey,
   readResults,
   resultsKey,
 } from '../queue.js';
@@ -726,10 +727,117 @@ suite('큐 워커: 이어받기와 진행 기반 상한(#19)', () => {
     expect(await lab.deadLetter.count()).toBe(0);
   });
 
+  it('앞선 사고가 남긴 진행 상태(연속 3)가 있어도 회복된 큐의 첫 주기에 작업을 실패시키지 않는다', { timeout: TIMEOUT }, async () => {
+    const target = await startTarget();
+    await target.configure({ switches: { rateLimit: true }, thresholds: { windowSec: 2, maxRequests: 5 } });
+    const lab = await makeLab();
+    // d3-resume.md 5절이 끝난 상태 그대로다(pages 21, seen 21, cycles 3). until 0은 정지가 한참 전에 끝났다는 뜻이다.
+    await lab.redis.hset(progressKey(lab.queue.name), { pages: 21, seen: 21, cycles: 3, until: 0 });
+    // 창을 먼저 다 써 둔다. 두 작업의 첫 로그인이 페이지 하나 받기 전에 429다(이 주기는 정말 무진행이다).
+    for (let i = 0; i < 5; i += 1) await fetch(`${target.origin}/transactions`);
+    await lab.startWorker('w1', realCollect(target.origin));
+    await lab.startWorker('w2', realCollect(target.origin));
+    const ids = [await lab.add(DEMO02, at(0), at(24)), await lab.add(DEMO02, at(0), at(48))];
+    expect(await lab.waitFinished(ids)).toEqual({ [ids[0] as string]: 'completed', [ids[1] as string]: 'completed' });
+    expect(target.hits.slice(5, 7).map((h) => [h.path, h.status])).toEqual([
+      ['/login', 429],
+      ['/login', 429],
+    ]);
+    expect(await lab.deadLetter.count()).toBe(0);
+  });
+
+  it('페이지 없이 끝난 완료도 진행으로 센다(빈 계좌, 빈 끝 페이지만 남은 이어받기)', { timeout: TIMEOUT }, async () => {
+    const lab = await makeLab();
+    const calls = new Map<string, number>();
+    // 작업마다 첫 호출은 429, 두 번째는 페이지 없이 완료. 완료를 진행으로 세지 않으면 429가 연속 주기로만 쌓인다.
+    await lab.startWorker('w1', async (data) => {
+      const n = (calls.get(data.from) ?? 0) + 1;
+      calls.set(data.from, n);
+      if (n === 1) return { ok: false, kind: 'RATE_LIMITED', detail: 'HTTP 429', retryAfterSec: 0.1 };
+      return { ok: true, rows: [], pages: 1 };
+    });
+    const ids: string[] = [];
+    for (let day = 2; day <= 6; day += 1) ids.push(await lab.add(DEMO01, `2026-01-0${day} 00:00:00`, ALL.to));
+    const states = await lab.waitFinished(ids);
+    expect(Object.values(states)).toEqual(Array(5).fill('completed'));
+    expect(await lab.deadLetter.count()).toBe(0);
+  });
+
+  it('다른 워커가 받은 페이지는 그 결과를 쓰기 전에도 진행으로 센다', { timeout: TIMEOUT }, async () => {
+    const lab = await makeLab();
+    // 직전까지 연속 2(K=3). 이번 주기에 아무도 못 받았으면 NO_PROGRESS가 맞다.
+    await lab.redis.hset(progressKey(lab.queue.name), { pages: 0, seen: 0, cycles: 2, until: Date.now() });
+    // 페이지를 받은 워커의 결과 쓰기(HSET)가 0.3초 걸린다. 그 사이 다른 워커가 429를 받는다.
+    const slow = new Proxy(lab.redis, {
+      get(obj, prop) {
+        if (prop === 'hset') {
+          return async (...args: unknown[]) => {
+            await sleep(300);
+            return (obj.hset as (...a: unknown[]) => Promise<number>)(...args);
+          };
+        }
+        const value = Reflect.get(obj, prop, obj) as unknown;
+        return typeof value === 'function' ? (value as (...a: unknown[]) => unknown).bind(obj) : value;
+      },
+    });
+    const row: Transaction = { seq: 1, at: '2026-01-02 01:00:00', memo: '급여', withdrawal: 0, deposit: 1000, balance: 1000 };
+    let received!: () => void;
+    const pageReceived = new Promise<void>((r) => (received = r));
+    const PAGED = '2026-01-02 00:00:00';
+    const bCalls: number[] = [];
+    const collectFn = async (data: CollectionJobData, options: CollectOptions): Promise<CollectResult> => {
+      if (data.from === PAGED) {
+        // 페이지를 받았다. onPage가 결과를 다 쓸 때까지 0.3초다.
+        setTimeout(received, 20);
+        await options.onPage?.([row], 1);
+        return { ok: true, rows: [row], pages: 2 };
+      }
+      bCalls.push(bCalls.length + 1);
+      if (bCalls.length === 1) {
+        await pageReceived; // 다른 워커가 페이지를 받은 20ms 뒤의 429
+        return { ok: false, kind: 'RATE_LIMITED', detail: 'HTTP 429', retryAfterSec: 0.1 };
+      }
+      return { ok: true, rows: [], pages: 1 };
+    };
+    await lab.startWorker('w1', collectFn, { redis: slow });
+    await lab.startWorker('w2', collectFn, { redis: slow });
+    const ids = [await lab.add(DEMO01, PAGED, ALL.to), await lab.add(DEMO01, '2026-01-03 00:00:00', ALL.to)];
+    expect(await lab.waitFinished(ids)).toEqual({ [ids[0] as string]: 'completed', [ids[1] as string]: 'completed' });
+    expect(await lab.deadLetter.count()).toBe(0);
+  });
+
+  it('같은 주기 안에서도 앞선 제한 뒤에 받은 페이지가 있으면 진행으로 센다', { timeout: TIMEOUT }, async () => {
+    const lab = await makeLab();
+    await lab.redis.hset(progressKey(lab.queue.name), { pages: 0, seen: 0, cycles: 2, until: Date.now() });
+    const row: Transaction = { seq: 1, at: '2026-01-02 01:00:00', memo: '급여', withdrawal: 0, deposit: 1000, balance: 1000 };
+    const FIRST = '2026-01-02 00:00:00';
+    let bCalls = 0;
+    // A: 이번 주기의 첫 429. 그때까지 아무도 페이지를 못 받았으니 연속 3이고 A는 NO_PROGRESS가 맞다.
+    // B: A가 DLQ로 간 뒤(같은 1초 정지 안) 페이지를 하나 받고 429. 주기는 같아도 큐는 나아갔다.
+    const collectFn = async (data: CollectionJobData, options: CollectOptions): Promise<CollectResult> => {
+      if (data.from === FIRST) return { ok: false, kind: 'RATE_LIMITED', detail: 'HTTP 429', retryAfterSec: 1 };
+      bCalls += 1;
+      if (bCalls === 1) {
+        await waitUntil(() => lab.events.some((e) => e.event === 'dead-letter'));
+        await options.onPage?.([row], 1);
+        return { ok: false, kind: 'RATE_LIMITED', detail: 'HTTP 429', retryAfterSec: 0.1 };
+      }
+      return { ok: true, rows: [], pages: 2 };
+    };
+    await lab.startWorker('w1', collectFn);
+    await lab.startWorker('w2', collectFn);
+    const first = await lab.add(DEMO01, FIRST, ALL.to);
+    const second = await lab.add(DEMO01, '2026-01-03 00:00:00', ALL.to);
+    expect(await lab.waitFinished([first, second])).toEqual({ [first]: 'failed', [second]: 'completed' });
+    expect((await lab.deadLetter.getJob(first))?.data.kind).toBe('NO_PROGRESS');
+    expect(await lab.deadLetter.getJob(second)).toBeUndefined();
+  });
+
   // 이어받는 실행이 4페이지를 받고 결과를 쓰는 자리에서 워커가 죽는다. 'after'는 행을 쓴 뒤·체크포인트
   // 전(같은 페이지를 다시 쓰게 된다), 'before'는 행을 쓰기 전(체크포인트가 행보다 먼저면 그 페이지가
   // 빠진다). 죽음은 결과 쓰기를 영영 돌아오지 않게 하고 워커를 강제로 닫아 만든다. 잠금이 풀리면
-  // 다른 워커의 멈춤 검사가 작업을 대기로 돌린다(프로세스를 실제로 죽이는 경로는 d3-resume.md).
+  // 다른 워커의 멈춤 검사가 작업을 대기로 돌린다. 프로세스를 실제로 죽이는 경로는 확인하지 않았다(테스트·실측 모두
+  // 같은 프로세스 안의 흉내다).
   it.each([
     ['after', 80],
     ['before', 60],

@@ -59,19 +59,30 @@ export type ProcessorDeps = {
   clock: Clock;
   log?: (event: WorkerEvent) => void;
   /**
-   * 진행 기반 상한(#19). 큐 전체에서 새 페이지 없이 지나간 속도 제한·차단 주기가 이만큼 이어지면
+   * 진행 기반 상한(#19). 큐 전체에서 페이지도 완료도 없이 이어진 속도 제한·차단 주기가 이만큼이면
    * 그 주기에 제한을 받은 작업을 DLQ에 NO_PROGRESS로 보낸다. 기본 `DEFAULT_NO_PROGRESS_CYCLES`.
    */
   noProgressCycles?: number;
 };
 
 /**
- * 진행 기반 상한의 기본값. 주기 하나는 큐 정지 한 번이고, 그동안 **큐의 어느 작업도** 새 페이지를
- * 받지 못했을 때만 센다(`progressKey`). 창(N)이 동시에 출발하는 워커들의 로그인 비용(워커당 2요청)보다
- * 크면 주기마다 누군가는 한 페이지 이상 받으므로 이 상한에 닿지 않는다. 닿는 것은 창이 로그인
- * 비용 이하라 아무도 못 나아가는 경우다. 3은 한두 주기의 우연(차단이 풀리는 순간과 요청이 엇갈린
- * 주기)은 넘기고, 그 이상은 기다려도 달라지지 않는다고 보는 값이다. 운영에서는
- * `WORKER_NO_PROGRESS_CYCLES`로 바꾼다.
+ * 진행 기반 상한의 기본값. 규칙은 이렇다(`COUNT_CYCLE`).
+ *
+ * - 주기 하나는 큐 정지 한 번이다. 같은 정지 안의 제한 여럿은 한 주기다.
+ * - 진행은 큐의 어느 작업이든 페이지를 받거나 작업을 완료한 것이다. 페이지 없이 끝난 완료(빈 계좌,
+ *   빈 끝 페이지만 남은 이어받기)도 진행이다.
+ * - 직전 주기 뒤로 진행이 있었으면 연속 수는 0이다. 같은 주기 안에서 앞선 제한 뒤에 진행이 있었어도 0이다.
+ * - 직전 정지가 끝난 지 `STALE_STREAK_MS`(60초)가 지나 온 제한은 연속이 아니다. 1부터 다시 센다.
+ * - 연속 수가 이 값에 닿은 주기에 제한을 받은 작업이 NO_PROGRESS로 DLQ에 간다.
+ *
+ * 창(N)이 동시에 출발하는 워커들의 로그인 비용(워커당 2요청)보다 크면 주기마다 누군가는 한 페이지
+ * 이상 받으므로 이 상한에 닿지 않는다. 닿는 것은 창이 로그인 비용 이하라 아무도 못 나아가는 경우다.
+ * 3은 한두 주기의 우연(차단이 풀리는 순간과 요청이 엇갈린 주기)은 넘기고, 그 이상은 기다려도
+ * 달라지지 않는다고 보는 값이다. 운영에서는 `WORKER_NO_PROGRESS_CYCLES`로 바꾼다.
+ *
+ * 남는 틈: 진행은 페이지를 받은 직후 한 번 왕복으로 센다. 그 한 번 왕복보다 짧은 간격으로 다른 워커의
+ * 429가 먼저 주기를 세고, 마침 그 주기가 상한에 닿는 주기라면 그 작업은 NO_PROGRESS로 간다. 상한
+ * 직전까지 무진행 주기가 이어진 뒤에만 생기는 일이다.
  *
  * 처음에는 작업마다 셌다. 워커 2개가 한 창을 나눠 쓰면 주기마다 한 작업만 한 페이지를 받는데,
  * 계속 진 작업이 큐는 나아가는 중에 NO_PROGRESS로 갔다(d3-resume.md, 기본 임계값 실측).
@@ -84,12 +95,19 @@ export const DEFAULT_NO_PROGRESS_CYCLES = 3;
 
 /**
  * 속도 제한·차단 주기 하나를 센다. 워커 프로세스 여럿이 부르므로 읽고 쓰기를 스크립트 하나로
- * 묶는다. 돌려주는 값은 큐 전체의 연속 무진행 주기 수다.
+ * 묶는다. 돌려주는 값은 큐 전체의 연속 무진행 주기 수다. `pages`는 페이지를 받거나 작업이
+ * 완료될 때마다 오른다(`creditProgress`).
  *
  * - 직전 주기의 큐 정지(`until`)가 끝나기 전에 온 제한은 같은 주기다. 워커 2개가 같이 출발해
- *   같은 순간 429를 받으면 주기는 하나다. 세지 않고 지금 값만 돌려준다.
- * - 새 주기면, 직전 주기 뒤로 어느 작업이든 페이지를 받았는지(`pages > seen`) 본다. 받았으면 0,
- *   아니면 1을 더한다.
+ *   같은 순간 429를 받으면 주기는 하나다. 다시 더하지 않는다. 다만 그 주기의 앞선 제한 뒤로 진행이
+ *   있었으면(`pages > seen`) 0으로 되돌린다. 앞선 제한 때는 아직 아무도 못 받았어도, 같은 정지 안에서
+ *   다른 워커가 받은 페이지가 있으면 큐는 나아간 것이다(#19 리뷰 3).
+ * - 새 주기면, 직전 주기 뒤로 진행이 있었는지(`pages > seen`) 본다. 있었으면 0, 없으면 1을 더한다.
+ * - **직전 정지가 끝난 지 `STALE_STREAK_MS`가 지났으면 이어진 주기가 아니다.** 연속 수를 0에서
+ *   다시 센다. 사고가 이어지는 동안에는 정지가 풀리자마자 다음 요청이 나가 곧 다음 제한을 받는다.
+ *   정지가 풀리고 한참 조용했다면 그 사이 큐가 비었거나 멈춰 있었던 것이고, 지난 사고의 연속 수를
+ *   이어받으면 회복된 큐의 첫 제한에서 멀쩡한 작업이 NO_PROGRESS로 간다(#19 리뷰 1: d3-resume.md
+ *   5절이 남긴 cycles 3). 새로 세면 첫 주기는 1이라 K가 2 이상이면 그 자리에서 끝나지 않는다.
  * - `until`은 더 긴 쪽을 남긴다. 같은 주기 안에서 429(10초) 뒤 403 차단(30초)이 오면 30초다.
  *
  * 시각은 Redis `TIME`이다. 워커 프로세스마다 시계가 다르면 같은 주기 판정이 어긋난다.
@@ -102,12 +120,23 @@ local seen = tonumber(redis.call('HGET', KEYS[1], 'seen') or '0')
 local cycles = tonumber(redis.call('HGET', KEYS[1], 'cycles') or '0')
 local untilMs = tonumber(redis.call('HGET', KEYS[1], 'until') or '0')
 if now >= untilMs then
+  if now > untilMs + tonumber(ARGV[2]) then cycles = 0 end
   if pages > seen then cycles = 0 else cycles = cycles + 1 end
+  redis.call('HSET', KEYS[1], 'seen', pages, 'cycles', cycles)
+elseif pages > seen then
+  cycles = 0
   redis.call('HSET', KEYS[1], 'seen', pages, 'cycles', cycles)
 end
 redis.call('HSET', KEYS[1], 'until', math.max(untilMs, now + tonumber(ARGV[1])))
 return cycles
 `;
+
+/**
+ * 직전 정지가 끝나고 이만큼 제한이 없었으면 연속이 끊긴 것으로 본다(`COUNT_CYCLE`). 사고가 이어지는
+ * 동안 정지가 풀린 뒤 다음 제한까지는 로그인 두 요청 남짓(실측 수 ms)이다. 60초는 그보다 넉넉하고,
+ * 지난 사고의 상태를 이어받을 만큼 짧다.
+ */
+const STALE_STREAK_MS = 60_000;
 
 export type ProcessorResult = { count: number };
 
@@ -192,14 +221,15 @@ export function createCollectionHandlers(deps: ProcessorDeps): CollectionHandler
       result = await deps.collect(data, {
         startPage: data.checkpoint?.nextPage ?? 1,
         onPage: async (rows, page) => {
+          // 진행은 **받자마자** 센다. 결과·체크포인트 쓰기(두 번 왕복) 뒤에 세면 그 사이 다른 워커가
+          // 받은 429가 먼저 주기를 세어, 이미 받은 페이지를 다음 주기로 넘긴다(#19 리뷰 1b). 쓰기 전에
+          // 죽어도 진행이 한 번 더 세어질 뿐이고, 그것은 상한을 늦출 뿐 행을 만들지 않는다.
+          await creditProgress();
           // **행을 먼저, 체크포인트를 나중에 쓴다.** 둘 사이에 워커가 죽으면 다시 시작한 쪽이
           // 같은 페이지를 한 번 더 받아 같은 seq에 덮어쓸 뿐이다. 반대 순서면 체크포인트만
           // 넘어가고 그 페이지의 행이 영영 빠진다.
           await writeResults(jobId, rows);
           await job.updateData({ ...job.data, checkpoint: { nextPage: page + 1 } });
-          // 큐 전체의 진행으로 센다(`COUNT_CYCLE`). 다른 작업이 제한을 받아도 이 페이지가 있으면
-          // 그 주기는 진행한 주기다.
-          await redis.hincrby(progressKey(queue.name), 'pages', 1);
         },
       });
     } catch (error) {
@@ -214,6 +244,10 @@ export function createCollectionHandlers(deps: ProcessorDeps): CollectionHandler
     }
 
     if (result.ok) {
+      // 완료도 진행이다. 빈 계좌(1페이지가 빈 페이지)나 끝을 확인하는 빈 페이지만 남은 이어받기는
+      // 페이지를 하나도 받지 않고 끝나는데, 세지 않으면 그런 완료가 섞인 사이의 제한이 전부 연속
+      // 무진행으로 쌓인다(#19 리뷰 2).
+      await creditProgress();
       // `onPage`를 부르지 않는 수집 함수도 있어 한 번 더 쓴다. seq 필드라 늘지 않는다.
       await writeResults(jobId, result.rows);
       // 건수는 이번 실행이 받은 행이 아니라 저장소 전체다. 이어받았으면 앞 주기에 쓴 행이
@@ -223,6 +257,11 @@ export function createCollectionHandlers(deps: ProcessorDeps): CollectionHandler
       return { count };
     }
     return dispose(job, jobId, result);
+  }
+
+  /** 큐 전체의 진행을 하나 센다(`progressKey`의 `pages`, `COUNT_CYCLE`). */
+  async function creditProgress(): Promise<void> {
+    await redis.hincrby(progressKey(queue.name), 'pages', 1);
   }
 
   /**
@@ -271,7 +310,7 @@ export function createCollectionHandlers(deps: ProcessorDeps): CollectionHandler
         // 작업이 전부 DLQ로 빠진다. 대가는 대기 작업마다 한 주기(로그인 한 번)다.
         //
         // 체크포인트는 여기서 쓰지 않는다. `onPage`가 페이지마다 이미 남겼고, 던지기 전에 끝났다.
-        const cycles = Number(await redis.eval(COUNT_CYCLE, 1, progressKey(queue.name), waitMs));
+        const cycles = Number(await redis.eval(COUNT_CYCLE, 1, progressKey(queue.name), waitMs, STALE_STREAK_MS));
         // 제한은 NO_PROGRESS로 끝낼 때도 건다. 이 작업을 끝내도 환경은 여전히 막혀 있어서, 걸지
         // 않으면 다음 작업이 바로 출발해 429를 또 받는다(출발지 차단 누적에도 들어간다).
         await queue.rateLimit(waitMs);
