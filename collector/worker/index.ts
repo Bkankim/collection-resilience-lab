@@ -14,7 +14,8 @@
  * - `WORKER_LIMIT_MAX`, `WORKER_LIMIT_DURATION_MS`: BullMQ `limiter`. 기본값과 대상 서버
  *   임계값의 관계는 `process.ts`의 `DEFAULT_WORKER_LIMITER` 주석.
  * - `WORKER_NO_PROGRESS_CYCLES`: 진행 기반 상한(#19). 큐 전체에서 페이지도 완료도 없이 이어진 속도
- *   제한·차단 주기가 이만큼이면 NO_PROGRESS로 DLQ에 보낸다. 기본 3. 규칙은 `DEFAULT_NO_PROGRESS_CYCLES` 주석.
+ *   제한·차단 주기가 이만큼이면 NO_PROGRESS로 DLQ에 보낸다. 기본 3. **2 이상의 정수**여야 하고, 1이면 워커를
+ *   만들 때 던진다(`createCollectionHandlers`). 규칙은 `DEFAULT_NO_PROGRESS_CYCLES` 주석.
  */
 
 import { Queue } from 'bullmq';

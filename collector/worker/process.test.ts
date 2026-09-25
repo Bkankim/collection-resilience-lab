@@ -948,6 +948,21 @@ suite('큐 워커: 이어받기와 진행 기반 상한(#19)', () => {
     expect(lab.events.some((e) => e.event === 'resume-reset')).toBe(false);
   });
 
+  it('진행 기반 상한 K는 2 이상의 정수여야 하고, 아니면 워커를 만들 때 던진다', async () => {
+    const lab = await makeLab();
+    const connection = createRedis('worker', REDIS_URL as string);
+    cleanups.push(async () => connection.disconnect());
+    const make = (noProgressCycles: number) => () =>
+      createCollectionWorker({
+        connection,
+        deps: { collect: async () => ({ ok: true, rows: [], pages: 1 }), redis: lab.redis, queue: lab.queue, deadLetter: lab.deadLetter, clock: systemClock, noProgressCycles },
+      });
+    // K=1이면 멀쩡한 큐의 첫 429(연속 1)에서 바로 DLQ, 0이면 모든 제한에서 DLQ, NaN이면 상한이 꺼진다.
+    for (const bad of [1, 0, Number.NaN, 2.5]) expect(make(bad), String(bad)).toThrow(RangeError);
+    const ok = make(2)();
+    await ok.close();
+  });
+
   it('총 건수가 페이지마다 늘고 주기마다 429로 끊겨도, 처음 실행이 잰 페이지 상한에서 UNKNOWN으로 멈춘다', { timeout: TIMEOUT }, async () => {
     const lab = await makeLab();
     let txRequests = 0;

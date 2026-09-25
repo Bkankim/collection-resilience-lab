@@ -182,6 +182,11 @@ export function createCollectionHandlers(deps: ProcessorDeps): CollectionHandler
   const { redis, queue, deadLetter, clock } = deps;
   const log = deps.log ?? (() => {});
   const noProgressLimit = deps.noProgressCycles ?? DEFAULT_NO_PROGRESS_CYCLES;
+  // K는 2 이상의 정수다(#19 최종 리뷰 8). 60초 넘게 끊긴 연속은 1부터 세므로 K=1이면 멀쩡한 큐의 첫 429에서
+  // 바로 DLQ다. 0이면 모든 제한이 DLQ, NaN이면 비교가 늘 거짓이라 상한이 조용히 꺼진다. 설정 오류라 던진다.
+  if (!Number.isSafeInteger(noProgressLimit) || noProgressLimit < 2) {
+    throw new RangeError(`진행 기반 상한(noProgressCycles, WORKER_NO_PROGRESS_CYCLES)은 2 이상의 정수여야 한다: ${noProgressLimit}`);
+  }
 
   if (deadLetter.name !== deadLetterQueueName(queue.name)) {
     // 이름이 어긋나면 DLQ 항목이 사람이 보지 않는 큐에 쌓인다. 조용히 틀리는 자리라 던진다.
