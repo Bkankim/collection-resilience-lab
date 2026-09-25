@@ -45,7 +45,7 @@ import {
 import type { CollectionJobData, DeadLetterData } from '../queue.js';
 import { redisUrlForTests } from '../redis-for-tests.js';
 import { createCollectionWorker } from './process.js';
-import type { ProcessorResult, WorkerEvent } from './process.js';
+import type { ProcessorDeps, ProcessorResult, WorkerEvent } from './process.js';
 
 const REDIS_URL = redisUrlForTests();
 const suite = REDIS_URL === undefined ? describe.skip : describe;
@@ -116,7 +116,11 @@ async function makeLab() {
     deadLetter,
     events,
     /** 진입점과 같은 조립으로 워커를 띄운다. `limiter`도 진입점 기본값 그대로다. */
-    async startWorker(workerName: string, collectFn: (data: CollectionJobData, options: CollectOptions) => Promise<CollectResult>) {
+    async startWorker(
+      workerName: string,
+      collectFn: (data: CollectionJobData, options: CollectOptions) => Promise<CollectResult>,
+      extra: Pick<ProcessorDeps, 'noProgressCycles'> = {},
+    ) {
       const connection = createRedis('worker', url);
       connections.push(connection);
       const worker = createCollectionWorker({
@@ -128,6 +132,7 @@ async function makeLab() {
           deadLetter,
           clock: systemClock,
           log: (event) => events.push({ ...event, worker: workerName, t: Date.now() }),
+          ...extra,
         },
       });
       workers.push(worker);
@@ -198,11 +203,17 @@ suite('큐 워커: 속도 제한(rate-limit 처분)', () => {
     let calls = 0;
     // 대상 서버의 Retry-After는 초 단위 정수(최소 1초)라 네 번이면 4초다. 가짜 수집 함수로
     // 0.1초짜리를 준다. 이 테스트가 보는 것은 BullMQ가 세는 방식이지 대상 서버가 아니다.
-    await lab.startWorker('w1', async () => {
-      calls += 1;
-      if (calls <= 4) return { ok: false, kind: 'RATE_LIMITED', detail: 'HTTP 429', retryAfterSec: 0.1 };
-      return { ok: true, rows: [row], pages: 1 };
-    });
+    // 가짜는 페이지를 하나도 받지 않으므로 진행 기반 상한(#19, 기본 3)이 세 번째에서 끊는다.
+    // 이 테스트는 그 상한이 아니라 시도 횟수를 보므로 상한을 넉넉히 둔다.
+    await lab.startWorker(
+      'w1',
+      async () => {
+        calls += 1;
+        if (calls <= 4) return { ok: false, kind: 'RATE_LIMITED', detail: 'HTTP 429', retryAfterSec: 0.1 };
+        return { ok: true, rows: [row], pages: 1 };
+      },
+      { noProgressCycles: 10 },
+    );
     const id = await lab.add(DEMO01, at(0), at(24));
     expect(await lab.waitFinished([id])).toEqual({ [id]: 'completed' });
 
@@ -643,5 +654,50 @@ suite('큐 워커: 이어받기와 진행 기반 상한(#19)', () => {
     const limited = lab.events.filter((e) => e.event === 'rate-limited');
     expect(limited.map((e) => e.attemptsMade)).toEqual([0, 0]);
     expect(await lab.deadLetter.count()).toBe(0);
+  });
+
+  it('N=2(로그인 비용 이하)면 한 페이지도 못 받는 주기가 K(기본 3)번 이어진 뒤 DLQ에 NO_PROGRESS로 남는다', { timeout: 20_000 }, async () => {
+    const target = await startTarget();
+    // 창 1초에 요청 2개. 로그인 2요청이 창을 다 써서 매 주기 1페이지에서 429다.
+    await target.configure({ switches: { rateLimit: true }, thresholds: { windowSec: 1, maxRequests: 2 } });
+    const lab = await makeLab();
+    await lab.startWorker('w1', realCollect(target.origin));
+    const id = await lab.add(DEMO01, ALL.from, ALL.to);
+    expect(await lab.waitFinished([id], 15_000)).toEqual({ [id]: 'failed' });
+
+    expect(pageTrace(target.hits)).toEqual(['1(429)', '1(429)', '1(429)']);
+    // 속도 제한은 여전히 시도 횟수를 깎지 않았다. 세 번째 주기에서 한 번에 failed로 갔다.
+    expect(lab.events.filter((e) => e.event === 'rate-limited').map((e) => e.attemptsMade)).toEqual([0, 0, 0]);
+    const job = await lab.queue.getJob(id);
+    expect(job?.attemptsMade).toBe(1);
+    expect(parseFailedReason(job?.failedReason).kind).toBe('NO_PROGRESS');
+    const dead = (await lab.deadLetter.getJob(id))?.data;
+    expect(dead).toMatchObject({ originalId: id, kind: 'NO_PROGRESS', attemptsMade: 1, raw: null });
+    expect(await lab.deadLetter.count()).toBe(1);
+    expect(await lab.redis.hlen(resultsKey(lab.queue.name, id))).toBe(0);
+  });
+
+  it('한 페이지라도 받은 주기가 끼면 진행 없는 주기 수를 처음부터 센다', { timeout: TIMEOUT }, async () => {
+    const lab = await makeLab();
+    const row: Transaction = { seq: 1, at: '2026-01-02 01:00:00', memo: '급여', withdrawal: 0, deposit: 1000, balance: 1000 };
+    const limited: CollectResult = { ok: false, kind: 'RATE_LIMITED', detail: 'HTTP 429', retryAfterSec: 0.1 };
+    const starts: number[] = [];
+    // 진행 없음, (1페이지 받고) 제한, 진행 없음 두 번, 성공. 진행 없는 주기가 연달아 셋이 되는
+    // 자리가 없으므로 K=3에서 끝까지 가야 한다. 두 번째 주기를 진행 없음으로 세면 네 번째에서 DLQ다.
+    await lab.startWorker('w1', async (_data, options) => {
+      starts.push(options.startPage ?? 1);
+      if (starts.length === 2) {
+        await options.onPage?.([row], 1);
+        return limited;
+      }
+      if (starts.length < 5) return limited;
+      return { ok: true, rows: [], pages: 2 };
+    });
+    const id = await lab.add(DEMO01, ALL.from, ALL.to);
+    expect(await lab.waitFinished([id])).toEqual({ [id]: 'completed' });
+
+    expect(starts).toEqual([1, 1, 2, 2, 2]);
+    expect(await lab.deadLetter.count()).toBe(0);
+    expect(((await lab.queue.getJob(id))?.returnvalue as ProcessorResult).count).toBe(1);
   });
 });

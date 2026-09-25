@@ -13,6 +13,8 @@
  * - `WORKER_CONCURRENCY`: 한 프로세스가 동시에 돌리는 작업 수. 기본 1.
  * - `WORKER_LIMIT_MAX`, `WORKER_LIMIT_DURATION_MS`: BullMQ `limiter`. 기본값과 대상 서버
  *   임계값의 관계는 `process.ts`의 `DEFAULT_WORKER_LIMITER` 주석.
+ * - `WORKER_NO_PROGRESS_CYCLES`: 진행 기반 상한(#19). 새 페이지 없이 지나간 속도 제한·차단
+ *   주기가 이만큼 이어지면 NO_PROGRESS로 DLQ에 보낸다. 기본 3(`DEFAULT_NO_PROGRESS_CYCLES`).
  */
 
 import { Queue } from 'bullmq';
@@ -22,7 +24,7 @@ import { collect } from '../client/session.js';
 import { createUndiciTransport } from '../client/transport.js';
 import { COLLECTION_QUEUE, createRedis, deadLetterQueueName } from '../queue.js';
 import type { CollectionJobData, DeadLetterData } from '../queue.js';
-import { DEFAULT_WORKER_LIMITER, createCollectionWorker } from './process.js';
+import { DEFAULT_NO_PROGRESS_CYCLES, DEFAULT_WORKER_LIMITER, createCollectionWorker } from './process.js';
 import type { WorkerEvent } from './process.js';
 
 const name = nonBlank(process.env.WORKER_NAME) ?? `worker-${process.pid}`;
@@ -33,6 +35,7 @@ const limiter = {
   max: positiveInt('WORKER_LIMIT_MAX', DEFAULT_WORKER_LIMITER.max),
   duration: positiveInt('WORKER_LIMIT_DURATION_MS', DEFAULT_WORKER_LIMITER.duration),
 };
+const noProgressCycles = positiveInt('WORKER_NO_PROGRESS_CYCLES', DEFAULT_NO_PROGRESS_CYCLES);
 
 function print(record: Record<string, unknown>): void {
   console.log(JSON.stringify({ t: new Date().toISOString(), worker: name, pid: process.pid, ...record }));
@@ -57,6 +60,7 @@ const worker = createCollectionWorker({
     deadLetter,
     clock: systemClock,
     log: (event: WorkerEvent) => print(event),
+    noProgressCycles,
   },
 });
 
@@ -88,7 +92,7 @@ for (const signal of ['SIGINT', 'SIGTERM'] as const) {
 }
 
 await worker.waitUntilReady();
-print({ event: 'ready', queue: queueName, origin, concurrency, limiter });
+print({ event: 'ready', queue: queueName, origin, concurrency, limiter, noProgressCycles });
 
 function nonBlank(value: string | undefined): string | undefined {
   return value === undefined || value.trim() === '' ? undefined : value;

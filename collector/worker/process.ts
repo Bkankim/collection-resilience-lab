@@ -29,14 +29,14 @@ import {
   parseFailedReason,
   resultsKey,
 } from '../queue.js';
-import type { CapturedRaw, CollectionJobData, DeadLetterData } from '../queue.js';
+import type { CapturedRaw, CollectionJobData, DeadLetterData, DeadLetterKind } from '../queue.js';
 
 /** 프로세서가 남기는 사건. 진입점은 JSON 한 줄로 찍고, 테스트는 모아서 본다. */
 export type WorkerEvent =
   | { event: 'completed'; jobId: string; attemptsMade: number; rows: number }
   | { event: 'rate-limited'; jobId: string; attemptsMade: number; kind: FailureKind; waitMs: number; detail: string }
   | { event: 'retry'; jobId: string; attemptsMade: number; kind: FailureKind | null; detail: string }
-  | { event: 'dead-letter'; jobId: string; attemptsMade: number; kind: FailureKind | null; detail: string }
+  | { event: 'dead-letter'; jobId: string; attemptsMade: number; kind: DeadLetterKind | null; detail: string }
   | { event: 'dead-letter-error'; jobId: string; detail: string }
   | { event: 'auth-block-error'; jobId: string; detail: string }
   | { event: 'auth-blocked'; jobId: string; loginId: string };
@@ -56,7 +56,20 @@ export type ProcessorDeps = {
   deadLetter: Queue<DeadLetterData>;
   clock: Clock;
   log?: (event: WorkerEvent) => void;
+  /**
+   * 진행 기반 상한(#19). 새 페이지 없이 지나간 속도 제한·차단 주기가 이만큼 이어지면 DLQ에
+   * NO_PROGRESS로 보낸다. 기본 `DEFAULT_NO_PROGRESS_CYCLES`.
+   */
+  noProgressCycles?: number;
 };
+
+/**
+ * 진행 기반 상한의 기본값. 한 주기 비용은 로그인 2요청에 페이지 몇 개라서, 창(N)이 로그인
+ * 비용보다 크면 주기마다 적어도 한 페이지는 받는다. 그런 작업은 이 상한에 닿지 않는다. 한
+ * 페이지도 못 받는 주기가 세 번 이어졌다면 우연(다른 작업과 창을 나눠 먹은 주기)보다는 창
+ * 자체가 로그인 비용 이하라고 본다. 운영에서는 `WORKER_NO_PROGRESS_CYCLES`로 바꾼다.
+ */
+export const DEFAULT_NO_PROGRESS_CYCLES = 3;
 
 export type ProcessorResult = { count: number };
 
@@ -88,6 +101,7 @@ export type CollectionHandlers = {
 export function createCollectionHandlers(deps: ProcessorDeps): CollectionHandlers {
   const { redis, queue, deadLetter, clock } = deps;
   const log = deps.log ?? (() => {});
+  const noProgressLimit = deps.noProgressCycles ?? DEFAULT_NO_PROGRESS_CYCLES;
 
   if (deadLetter.name !== deadLetterQueueName(queue.name)) {
     // 이름이 어긋나면 DLQ 항목이 사람이 보지 않는 큐에 쌓인다. 조용히 틀리는 자리라 던진다.
@@ -136,6 +150,7 @@ export function createCollectionHandlers(deps: ProcessorDeps): CollectionHandler
     }
 
     let result: CollectResult;
+    let progressed = false;
     try {
       result = await deps.collect(data, {
         startPage: data.checkpoint?.nextPage ?? 1,
@@ -143,8 +158,10 @@ export function createCollectionHandlers(deps: ProcessorDeps): CollectionHandler
           // **행을 먼저, 체크포인트를 나중에 쓴다.** 둘 사이에 워커가 죽으면 다시 시작한 쪽이
           // 같은 페이지를 한 번 더 받아 같은 seq에 덮어쓸 뿐이다. 반대 순서면 체크포인트만
           // 넘어가고 그 페이지의 행이 영영 빠진다.
+          // 한 페이지라도 받았으니 진행 없는 주기 수는 0부터 다시 센다.
           await writeResults(jobId, rows);
-          await job.updateData({ ...job.data, checkpoint: { nextPage: page + 1 } });
+          await job.updateData({ ...job.data, checkpoint: { nextPage: page + 1, noProgressCycles: 0 } });
+          progressed = true;
         },
       });
     } catch (error) {
@@ -167,7 +184,7 @@ export function createCollectionHandlers(deps: ProcessorDeps): CollectionHandler
       log({ event: 'completed', jobId, attemptsMade: job.attemptsMade, rows: count });
       return { count };
     }
-    return dispose(job, jobId, result);
+    return dispose(job, jobId, result, progressed);
   }
 
   /**
@@ -189,7 +206,8 @@ export function createCollectionHandlers(deps: ProcessorDeps): CollectionHandler
     await redis.hset(resultsKey(queue.name, jobId), fields);
   }
 
-  async function dispose(job: Job<CollectionJobData>, jobId: string, failure: Failure): Promise<never> {
+  /** `progressed`: 이번 실행에서 한 페이지라도 받았나. 진행 기반 상한(#19)이 본다. */
+  async function dispose(job: Job<CollectionJobData>, jobId: string, failure: Failure, progressed: boolean): Promise<never> {
     const { kind, detail } = failure;
 
     switch (DISPOSITION[kind]) {
@@ -204,6 +222,26 @@ export function createCollectionHandlers(deps: ProcessorDeps): CollectionHandler
         const waitSec = 'retryAfterSec' in failure && failure.retryAfterSec !== undefined ? failure.retryAfterSec : DEFAULT_RATE_LIMIT_WAIT_SEC;
         const waitMs = Math.max(1, Math.round(waitSec * 1000));
         log({ event: 'rate-limited', jobId, attemptsMade: job.attemptsMade, kind, waitMs, detail });
+
+        // 진행 기반 상한(#19). 이번 실행에서 한 페이지라도 받았으면 이 주기는 진행한 주기라
+        // 0이다. `onPage`가 되돌려 둔 0에 1을 더하면 진행한 주기를 진행 없음으로 세게 된다.
+        // 시도 횟수 상한을 두지 않는 이유는 "환경이 막은 실패는 작업 탓이 아니다"(`CONSUMES_ATTEMPT`)
+        // 와 충돌해서다. 이 상한은 환경 때문에 느린 것(주기마다 몇 페이지씩 나아간다)은 두고,
+        // 아예 못 나아가는 것(창이 로그인 비용 이하)만 잡는다.
+        const checkpoint = { nextPage: 1, ...job.data.checkpoint };
+        const cycles = progressed ? 0 : (job.data.checkpoint?.noProgressCycles ?? 0) + 1;
+        if (cycles >= noProgressLimit) {
+          // 제한은 그대로 건다. 이 작업을 끝내도 환경은 여전히 막혀 있어서, 걸지 않으면 다음
+          // 작업이 바로 출발해 429를 또 받는다(출발지 차단 누적에도 들어간다).
+          await queue.rateLimit(waitMs);
+          const reason =
+            `속도 제한·차단 주기 ${cycles}번 연속 새 페이지 없음(${checkpoint.nextPage}페이지에서 멈춤). ` +
+            `창이 로그인 비용(2요청) 이하인지 대상 서버 임계값을 확인할 것. 마지막 실패 ${kind}: ${detail}`;
+          throw await recordDead(new UnrecoverableError(formatFailedReason('NO_PROGRESS', reason)), job, jobId, 'NO_PROGRESS', reason);
+        }
+        // **던지기 전에** 남긴다. RateLimitError를 던지면 작업이 대기로 돌아가고, 다음에 꺼낸
+        // 워커는 Redis의 작업 데이터를 읽는다.
+        await job.updateData({ ...job.data, checkpoint: { ...checkpoint, noProgressCycles: cycles } });
         await queue.rateLimit(waitMs);
         throw Worker.RateLimitError();
       }
@@ -249,7 +287,7 @@ export function createCollectionHandlers(deps: ProcessorDeps): CollectionHandler
     error: Error,
     job: Job<CollectionJobData>,
     jobId: string,
-    kind: FailureKind | null,
+    kind: DeadLetterKind | null,
     detail: string,
     raw?: ClassifyInput,
   ): Promise<Error> {

@@ -45,6 +45,11 @@ export type CollectionJobData = {
 export type CollectionCheckpoint = {
   /** 다시 시작할 때 받을 페이지. 이 앞 페이지의 행은 결과 저장소에 이미 있다. */
   nextPage: number;
+  /**
+   * 새 페이지 없이 지나간 속도 제한·차단 주기가 몇 번 이어졌나. 한 페이지라도 받으면 0이다.
+   * 워커의 상한(`noProgressCycles`)에 닿으면 NO_PROGRESS로 DLQ에 간다(`DeadLetterKind`).
+   */
+  noProgressCycles: number;
 };
 
 /**
@@ -208,19 +213,36 @@ export async function readResults(redis: Redis, queueName: string, jobId: string
  * `detail`에는 원본을 싣지 않는다. 원본(CAPTURE_RAW)은 크고, 가려야 할 헤더가 있다
  * (`capture.ts`). 원본을 어디에 둘지는 #13이 정한다.
  */
-export function formatFailedReason(kind: FailureKind, detail: string): string {
+export function formatFailedReason(kind: DeadLetterKind, detail: string): string {
   return `${kind}: ${detail}`;
 }
 
+/**
+ * 최종 실패에 남는 종류. 분류기의 일곱 종에 워커가 붙이는 NO_PROGRESS 하나를 더한다.
+ *
+ * NO_PROGRESS(#19): 속도 제한·출발지 차단 주기를 워커의 상한(기본 3)번 연달아 거치는 동안
+ * 새 페이지를 하나도 받지 못한 작업이다. 창(N)이 로그인 비용(2요청) 이하면 영원히 한 페이지도
+ * 못 받는데, 속도 제한은 시도 횟수를 깎지 않아(`CONSUMES_ATTEMPT`) 저절로 끝나지 않는다.
+ *
+ * **`FailureKind`에 넣지 않는다.** 분류기의 일곱 종은 응답 하나를 보고 정하는 것이고
+ * `FIRST_REMEDY`·`CONSUMES_ATTEMPT`·`DISPOSITION`이 그 일곱 종에 대한 표다. NO_PROGRESS는
+ * 여러 주기를 가로질러 본 판단이라 응답 하나로는 나올 수 없고, 표에 칸을 만들면 분류기가
+ * 낼 수 없는 종류에 처분을 정하는 셈이 된다. 이름이 붙는 자리는 최종 실패(`failedReason`,
+ * DLQ)뿐이다.
+ */
+export type DeadLetterKind = FailureKind | 'NO_PROGRESS';
+
+const DEAD_LETTER_KINDS: readonly DeadLetterKind[] = [...FAILURE_KINDS, 'NO_PROGRESS'];
+
 export type RecordedFailure = {
   /** null이면 워커가 분류하지 못한 실패다. 자격증명 없음 같은 설정 오류가 여기로 온다. */
-  kind: FailureKind | null;
+  kind: DeadLetterKind | null;
   detail: string;
 };
 
 export function parseFailedReason(reason: string | undefined): RecordedFailure {
   const text = reason ?? '';
-  for (const kind of FAILURE_KINDS) {
+  for (const kind of DEAD_LETTER_KINDS) {
     const prefix = `${kind}: `;
     if (text.startsWith(prefix)) return { kind, detail: text.slice(prefix.length) };
   }
@@ -305,7 +327,7 @@ export type CapturedRaw =
 export type DeadLetterData = {
   originalId: string;
   /** null이면 분류하지 못한 실패다. 자격증명 없음 같은 설정 오류가 여기로 온다. */
-  kind: FailureKind | null;
+  kind: DeadLetterKind | null;
   detail: string;
   /** 이번 시도를 포함한 시도 수. 원래 작업이 failed로 간 뒤의 `attemptsMade`와 같다. */
   attemptsMade: number;
