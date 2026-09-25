@@ -862,6 +862,44 @@ suite('큐 워커: 이어받기와 진행 기반 상한(#19)', () => {
     expect(resumed - longAt).toBeGreaterThanOrEqual(950);
   });
 
+  it('주기 세기(Redis eval)가 한 번 실패해도 속도 제한은 속도 제한이다: 시도를 깎지 않고 큐를 멈추고 DLQ로 보내지 않는다', { timeout: TIMEOUT }, async () => {
+    const lab = await makeLab();
+    let evals = 0;
+    const flaky = new Proxy(lab.redis, {
+      get(obj, prop) {
+        if (prop === 'eval') {
+          return async (...args: unknown[]) => {
+            evals += 1;
+            if (evals === 1) throw new Error('BUSY Redis is busy running a script');
+            return (obj.eval as (...a: unknown[]) => Promise<unknown>)(...args);
+          };
+        }
+        const value = Reflect.get(obj, prop, obj) as unknown;
+        return typeof value === 'function' ? (value as (...a: unknown[]) => unknown).bind(obj) : value;
+      },
+    });
+    const starts: number[] = [];
+    await lab.startWorker(
+      'w1',
+      async () => {
+        starts.push(Date.now());
+        if (starts.length === 1) return { ok: false, kind: 'RATE_LIMITED', detail: 'HTTP 429', retryAfterSec: 0.5 };
+        return { ok: true, rows: [], pages: 1 };
+      },
+      { redis: flaky },
+    );
+    // 시도 1번짜리 작업. 일반 오류로 새면 첫 제한에서 바로 failed·DLQ(kind null)다.
+    const id = await lab.add(DEMO01, ALL.from, ALL.to, { attempts: 1 });
+    expect(await lab.waitFinished([id])).toEqual({ [id]: 'completed' });
+
+    expect((await lab.queue.getJob(id))?.attemptsMade).toBe(1);
+    expect(await lab.deadLetter.count()).toBe(0);
+    expect(lab.events.filter((e) => e.event === 'retry')).toEqual([]);
+    expect(lab.events.some((e) => e.event === 'progress-count-error')).toBe(true);
+    // 세지 못해도 Retry-After(0.5초)만큼 큐를 멈췄다.
+    expect((starts[1] as number) - (starts[0] as number)).toBeGreaterThanOrEqual(450);
+  });
+
   // 이어받는 실행이 4페이지를 받고 결과를 쓰는 자리에서 워커가 죽는다. 'after'는 행을 쓴 뒤·체크포인트
   // 전(같은 페이지를 다시 쓰게 된다), 'before'는 행을 쓰기 전(체크포인트가 행보다 먼저면 그 페이지가
   // 빠진다). 죽음은 결과 쓰기를 영영 돌아오지 않게 하고 워커를 강제로 닫아 만든다. 잠금이 풀리면

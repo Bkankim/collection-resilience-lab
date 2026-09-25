@@ -40,6 +40,7 @@ export type WorkerEvent =
   | { event: 'retry'; jobId: string; attemptsMade: number; kind: FailureKind | null; detail: string }
   | { event: 'dead-letter'; jobId: string; attemptsMade: number; kind: DeadLetterKind | null; detail: string }
   | { event: 'dead-letter-error'; jobId: string; detail: string }
+  | { event: 'progress-count-error'; jobId: string; detail: string }
   | { event: 'auth-block-error'; jobId: string; detail: string }
   | { event: 'auth-blocked'; jobId: string; loginId: string };
 
@@ -317,10 +318,25 @@ export function createCollectionHandlers(deps: ProcessorDeps): CollectionHandler
         // 작업이 전부 DLQ로 빠진다. 대가는 대기 작업마다 한 주기(로그인 한 번)다.
         //
         // 체크포인트는 여기서 쓰지 않는다. `onPage`가 페이지마다 이미 남겼고, 던지기 전에 끝났다.
-        const [cycles, pauseMs] = (await redis.eval(COUNT_CYCLE, 1, progressKey(queue.name), waitMs, STALE_STREAK_MS)) as [number, number];
+        //
+        // **세기가 실패해도 속도 제한은 속도 제한이다.** 예전에는 eval 오류가 표 바깥의 일반 오류로 새서
+        // 시도 횟수를 깎고, 마지막 시도면 kind null로 DLQ에 갔고, 큐도 멈추지 않았다(#19 최종 리뷰 4 재현:
+        // attempts 1 작업이 첫 429에서 failed). 세지 못한 주기는 세지 않은 채로 둔다. 그 작업의 Retry-After만큼
+        // 멈추고 대기로 돌린다. 세지 못한 주기로는 NO_PROGRESS를 내지 않는다(상한이 한 주기 늦어질 뿐이다).
+        let cycles = 0;
+        let pauseMs = waitMs;
+        try {
+          [cycles, pauseMs] = (await redis.eval(COUNT_CYCLE, 1, progressKey(queue.name), waitMs, STALE_STREAK_MS)) as [number, number];
+        } catch (error) {
+          log({ event: 'progress-count-error', jobId, detail: error instanceof Error ? error.message : String(error) });
+        }
         // 제한은 NO_PROGRESS로 끝낼 때도 건다. 이 작업을 끝내도 환경은 여전히 막혀 있어서, 걸지
         // 않으면 다음 작업이 바로 출발해 429를 또 받는다(출발지 차단 누적에도 들어간다).
         // 정지 길이는 자기 Retry-After가 아니라 주기 창(`until`)까지다(`COUNT_CYCLE` 주석).
+        //
+        // 이 호출이 실패하면(#19 최종 리뷰 5) 여전히 표 바깥의 일반 오류로 새서 시도를 깎는다. 정지 없이
+        // RateLimitError를 던지면 작업이 곧바로 다시 꺼내져 막힌 대상에 로그인을 되풀이하므로, 그쪽이 더
+        // 나쁘다고 보고 그대로 둔다. 이미 센 주기는 남는다.
         await queue.rateLimit(Math.max(1, pauseMs));
         if (cycles >= noProgressLimit) {
           const nextPage = job.data.checkpoint?.nextPage ?? 1;
