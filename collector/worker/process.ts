@@ -253,7 +253,8 @@ export function createCollectionHandlers(deps: ProcessorDeps): CollectionHandler
     try {
       result = await deps.collect(job.data, {
         startPage: checkpoint?.nextPage ?? 1,
-        onPage: async (rows, page) => {
+        ...(checkpoint?.maxPage === undefined ? {} : { maxPage: checkpoint.maxPage }),
+        onPage: async (rows, page, maxPage) => {
           // 진행은 **받자마자** 센다. 결과·체크포인트 쓰기(두 번 왕복) 뒤에 세면 그 사이 다른 워커가
           // 받은 429가 먼저 주기를 세어, 이미 받은 페이지를 다음 주기로 넘긴다(#19 리뷰 1b). 쓰기 전에
           // 죽어도 진행이 한 번 더 세어질 뿐이고, 그것은 상한을 늦출 뿐 행을 만들지 않는다.
@@ -263,7 +264,8 @@ export function createCollectionHandlers(deps: ProcessorDeps): CollectionHandler
           // 넘어가고 그 페이지의 행이 영영 빠진다.
           await writeResults(jobId, rows);
           const written = await redis.hlen(key);
-          await job.updateData({ ...job.data, checkpoint: { nextPage: page + 1, rows: written } });
+          const cap = maxPage ?? checkpoint?.maxPage;
+          await job.updateData({ ...job.data, checkpoint: { nextPage: page + 1, rows: written, ...(cap === undefined ? {} : { maxPage: cap }) } });
         },
       });
     } catch (error) {

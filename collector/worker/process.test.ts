@@ -23,7 +23,7 @@ import type { Redis } from 'ioredis';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import { buildApp } from '../../target/app.js';
-import { buildLedger } from '../../target/transactions.js';
+import { TRANSACTIONS_CONTENT_TYPE, buildLedger, encodeEucKr, renderTransactionsHtml, selectPage } from '../../target/transactions.js';
 import type { Failure } from '../client/classify.js';
 import { systemClock } from '../client/clock.js';
 import type { Transaction } from '../client/parse.js';
@@ -946,6 +946,33 @@ suite('큐 워커: 이어받기와 진행 기반 상한(#19)', () => {
     expect(await lab.waitFinished([id])).toEqual({ [id]: 'completed' });
     expect(starts).toEqual([1, 4]);
     expect(lab.events.some((e) => e.event === 'resume-reset')).toBe(false);
+  });
+
+  it('총 건수가 페이지마다 늘고 주기마다 429로 끊겨도, 처음 실행이 잰 페이지 상한에서 UNKNOWN으로 멈춘다', { timeout: TIMEOUT }, async () => {
+    const lab = await makeLab();
+    let txRequests = 0;
+    // 인증은 통과. 거래내역 p페이지는 총 (p+1)×20건이라 totalPages가 매 페이지 는다. 거래내역 요청 세 번마다 429.
+    const transport: Transport = async (req) => {
+      if (req.path === '/login') return { status: 200, headers: {}, body: Buffer.from('{"next":"otp"}') };
+      if (req.path === '/auth/otp') return { status: 200, headers: {}, body: Buffer.from('{"level":"FULL"}') };
+      txRequests += 1;
+      if (txRequests > 60) throw new Error('끝나지 않는다');
+      if (txRequests % 3 === 0) return { status: 429, headers: { 'retry-after': '0' }, body: Buffer.from('{"error":"RATE_LIMITED"}') };
+      const page = Number(req.path.split('page=')[1]);
+      const html = renderTransactionsHtml(selectPage(DEMO01.accountNo, (page + 1) * 20, page));
+      return { status: 200, headers: { 'content-type': TRANSACTIONS_CONTENT_TYPE }, body: encodeEucKr(html) };
+    };
+    await lab.startWorker('w1', (data, options) =>
+      collect({ transport, clock: systemClock }, data.loginId, data.accountNo, data.from, data.to, options),
+    );
+    const id = await lab.add(DEMO01, ALL.from, ALL.to);
+    expect(await lab.waitFinished([id], 10_000)).toEqual({ [id]: 'failed' });
+
+    // 첫 실행: 1페이지(총 40건, 2페이지 → 상한 3), 2페이지, 3번째 요청 429. 이어받은 실행의 3페이지가 상한이다.
+    const dead = (await lab.deadLetter.getJob(id))?.data;
+    expect(dead?.kind).toBe('UNKNOWN');
+    expect(dead?.detail).toContain('totalPages + 1(3)');
+    expect(txRequests).toBe(4);
   });
 
   it('작업을 지우고 결과 키를 남긴 채 다시 넣으면, 건수와 결과는 새 실행의 행뿐이다', { timeout: TIMEOUT }, async () => {

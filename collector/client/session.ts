@@ -50,6 +50,12 @@ export type CollectOptions = {
   /** 이 페이지부터 받는다. 기본 1. 로그인은 여기와 상관없이 다시 한다(세션 재사용은 범위 밖). */
   startPage?: number;
   /**
+   * 페이지 상한(`totalPages + 1`). 이어받을 때 처음 실행이 잰 값을 넘긴다. 없으면 이번에 처음 받은
+   * 페이지에서 잰다. 이어받을 때마다 새로 재면 총 건수가 계속 느는 서버에서 상한이 따라 늘어 멈추지
+   * 않는다(#19 최종 리뷰 6).
+   */
+  maxPage?: number;
+  /**
    * 빈 페이지가 아닌 페이지를 받을 때마다 부른다. 기간으로 거른 행과 그 페이지 번호다. 걸러서
    * 0행이 된 페이지에도 부른다. 부르지 않으면 이어받을 자리가 그 페이지 앞에 머물러,
    * 기간 밖 페이지가 많은 작업은 다시 시작할 때마다 같은 페이지를 또 받는다. 끝을 확인하는
@@ -59,7 +65,7 @@ export type CollectOptions = {
    * 워커가 결과·체크포인트를 쓰지 못했는데 다음 페이지로 넘어가면, 다시 시작한 쪽이 이어받을
    * 자리를 잃는다.
    */
-  onPage?: (rows: Transaction[], page: number) => Promise<void>;
+  onPage?: (rows: Transaction[], page: number, maxPage?: number) => Promise<void>;
 };
 
 /** `YYYY-MM-DD` 또는 `YYYY-MM-DD HH:mm:ss`. 대상 서버의 거래일시 형식과 같다. */
@@ -196,10 +202,9 @@ export class CollectorSession {
    * 서버처럼 앞의 검사를 통과하면서도 끝나지 않는 경우를 막는 상한이다. 둘 다 흐름이나
    * 서버 계약이 깨진 것이라 UNKNOWN과 원본으로 넘긴다.
    *
-   * 상한은 호출 한 번 안에서만 잰다. 매 주기 속도 제한에 끊겨 다시 시작하면서 총 건수도
-   * 계속 늘어나는 서버라면 시작할 때마다 상한이 새로 잡혀 이 검사로는 멈추지 않는다. 워커의
-   * 진행 기반 상한도 페이지가 늘어나는 한 걸리지 않는다. 그런 서버를 붙일 일이 생기면
-   * 상한을 체크포인트에 같이 남겨야 한다.
+   * 이어받는 호출은 처음 실행이 잰 상한(`options.maxPage`)을 받는다. 호출마다 새로 재면 매 주기 속도
+   * 제한에 끊기면서 총 건수도 계속 느는 서버에서 상한이 따라 늘어 멈추지 않는다(#19 최종 리뷰 6). 잰
+   * 상한은 `onPage`의 세 번째 인자로 알려 주고, 워커가 체크포인트에 남긴다.
    *
    * 실패하면 그 페이지의 분류 실패를 그대로 돌려준다. 대응은 워커(#13)가 FIRST_REMEDY로 한다.
    */
@@ -212,7 +217,7 @@ export class CollectorSession {
     const lower = normalizeBound(from, '00:00:00');
     const upper = normalizeBound(to, '23:59:59');
     const rows: Transaction[] = [];
-    let maxPage: number | undefined;
+    let maxPage = options.maxPage;
 
     for (let page = options.startPage ?? 1; ; page += 1) {
       const { input, result } = await this.#fetchPage(accountNo, page);
@@ -233,7 +238,10 @@ export class CollectorSession {
         return {
           ok: false,
           kind: 'UNKNOWN',
-          detail: `이번에 처음 받은 페이지(${options.startPage ?? 1})의 totalPages + 1(${maxPage})페이지까지 빈 페이지가 오지 않았다`,
+          detail:
+            options.maxPage === undefined
+              ? `이번에 처음 받은 페이지(${options.startPage ?? 1})의 totalPages + 1(${maxPage})페이지까지 빈 페이지가 오지 않았다`
+              : `처음 실행이 잰 totalPages + 1(${maxPage})페이지까지 빈 페이지가 오지 않았다`,
           raw,
         };
       }
@@ -241,7 +249,7 @@ export class CollectorSession {
       // 파서가 형식을 검증하므로 여기서 다시 보지 않는다.
       const kept = result.page.rows.filter((row) => row.at >= lower && row.at <= upper);
       rows.push(...kept);
-      await options.onPage?.(kept, page);
+      await options.onPage?.(kept, page, maxPage);
     }
   }
 

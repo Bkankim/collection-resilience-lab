@@ -52,6 +52,8 @@ export type CollectionCheckpoint = {
    * 없으면(이 필드를 넣기 전의 체크포인트) 확인하지 않는다.
    */
   rows?: number;
+  /** 처음 실행이 잰 페이지 상한(`totalPages + 1`). 이어받을 때 세션에 넘긴다(`CollectOptions.maxPage`). */
+  maxPage?: number;
 };
 
 /**
