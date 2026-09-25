@@ -41,6 +41,27 @@ export type SessionOptions = {
 
 export type CollectResult = { ok: true; rows: Transaction[]; pages: number } | Failure;
 
+/**
+ * 이어받기(#19). 속도 제한·출발지 차단 창보다 큰 작업이 매 주기 로그인부터 다시 하며 끝나지
+ * 않던 것(TROUBLESHOOTING 4번)을 워커가 풀 때 쓴다. 워커는 받은 페이지마다 행을 결과
+ * 저장소에 쓰고 다음 페이지 번호를 작업 데이터에 남긴 뒤, 다시 시작할 때 그 번호를 넘긴다.
+ */
+export type CollectOptions = {
+  /** 이 페이지부터 받는다. 기본 1. 로그인은 여기와 상관없이 다시 한다(세션 재사용은 범위 밖). */
+  startPage?: number;
+  /**
+   * 빈 페이지가 아닌 페이지를 받을 때마다 부른다. 기간으로 거른 행과 그 페이지 번호다. 걸러서
+   * 0행이 된 페이지에도 부른다. 부르지 않으면 이어받을 자리가 그 페이지 앞에 머물러,
+   * 기간 밖 페이지가 많은 작업은 다시 시작할 때마다 같은 페이지를 또 받는다. 끝을 확인하는
+   * 빈 페이지에는 부르지 않는다. 받은 행이 없고, 그 뒤는 곧 완료다.
+   *
+   * **돌아올 때까지 다음 페이지를 보내지 않는다.** 여기서 던지면 수집도 그 예외로 끝난다.
+   * 워커가 결과·체크포인트를 쓰지 못했는데 다음 페이지로 넘어가면, 다시 시작한 쪽이 이어받을
+   * 자리를 잃는다.
+   */
+  onPage?: (rows: Transaction[], page: number) => Promise<void>;
+};
+
 /** `YYYY-MM-DD` 또는 `YYYY-MM-DD HH:mm:ss`. 대상 서버의 거래일시 형식과 같다. */
 const DATE_ONLY = /^\d{4}-\d{2}-\d{2}$/;
 const DATE_TIME = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/;
@@ -160,8 +181,8 @@ export class CollectorSession {
   }
 
   /**
-   * 1페이지부터 빈 페이지가 나올 때까지 넘기고, 거래일시가 `[from, to]`(양끝 포함)인
-   * 행만 남긴다. 날짜만 주면 `from`은 그날 00:00:00, `to`는 23:59:59로 읽는다.
+   * 1페이지(이어받으면 `startPage`)부터 빈 페이지가 나올 때까지 넘기고, 거래일시가
+   * `[from, to]`(양끝 포함)인 행만 남긴다. 날짜만 주면 `from`은 그날 00:00:00, `to`는 23:59:59로 읽는다.
    *
    * 끝을 `totalPages`가 아니라 빈 페이지로 판단한다. 분류기가 "행 0개 = 마지막 페이지
    * 이후"를 요약 줄과 맞춰 검증하므로 빈 페이지가 곧 끝이라는 신호가 확실하다.
@@ -169,24 +190,31 @@ export class CollectorSession {
    * 다만 파서는 한 페이지 안의 일관성만 본다. 서버가 `?page=`를 무시하고 매번 1페이지를
    * 주면 그 응답은 그 자체로 멀쩡해서 빈 페이지가 영영 오지 않는다. 그래서 루프가 두
    * 가지를 더 본다. 받은 페이지가 **요청한 페이지·계좌인지**, 그리고 페이지 번호가
-   * 첫 페이지의 `totalPages + 1`을 넘지 않는지. 뒤의 것은 총 건수가 매 페이지 늘어나는
+   * 이번에 처음 받은 페이지의 `totalPages + 1`을 넘지 않는지. 이어받으면 1페이지를 받지
+   * 않으므로 상한은 시작한 페이지의 응답에서 잰다. 멀쩡한 서버라면 어느 페이지나 같은
+   * `totalPages`를 싣는다. 뒤의 것은 총 건수가 매 페이지 늘어나는
    * 서버처럼 앞의 검사를 통과하면서도 끝나지 않는 경우를 막는 상한이다. 둘 다 흐름이나
    * 서버 계약이 깨진 것이라 UNKNOWN과 원본으로 넘긴다.
    *
+   * 상한은 호출 한 번 안에서만 잰다. 매 주기 속도 제한에 끊겨 다시 시작하면서 총 건수도
+   * 계속 늘어나는 서버라면 시작할 때마다 상한이 새로 잡혀 이 검사로는 멈추지 않는다. 워커의
+   * 진행 기반 상한도 페이지가 늘어나는 한 걸리지 않는다. 그런 서버를 붙일 일이 생기면
+   * 상한을 체크포인트에 같이 남겨야 한다.
+   *
    * 실패하면 그 페이지의 분류 실패를 그대로 돌려준다. 대응은 워커(#13)가 FIRST_REMEDY로 한다.
    */
-  async collect(accountNo: string, from: string, to: string): Promise<CollectResult> {
-    const result = await this.#collect(accountNo, from, to);
+  async collect(accountNo: string, from: string, to: string, options: CollectOptions = {}): Promise<CollectResult> {
+    const result = await this.#collect(accountNo, from, to, options);
     return result.ok ? result : redactFailure(result);
   }
 
-  async #collect(accountNo: string, from: string, to: string): Promise<CollectResult> {
+  async #collect(accountNo: string, from: string, to: string, options: CollectOptions): Promise<CollectResult> {
     const lower = normalizeBound(from, '00:00:00');
     const upper = normalizeBound(to, '23:59:59');
     const rows: Transaction[] = [];
     let maxPage: number | undefined;
 
-    for (let page = 1; ; page += 1) {
+    for (let page = options.startPage ?? 1; ; page += 1) {
       const { input, result } = await this.#fetchPage(accountNo, page);
       if (!result.ok) return result;
       // 성공은 분류기를 거친 응답에서만 나오므로 input이 항상 있다.
@@ -205,15 +233,15 @@ export class CollectorSession {
         return {
           ok: false,
           kind: 'UNKNOWN',
-          detail: `첫 페이지의 totalPages + 1(${maxPage})페이지까지 빈 페이지가 오지 않았다`,
+          detail: `이번에 처음 받은 페이지(${options.startPage ?? 1})의 totalPages + 1(${maxPage})페이지까지 빈 페이지가 오지 않았다`,
           raw,
         };
       }
       // 거래일시 형식이 고정 길이 `YYYY-MM-DD HH:mm:ss`라 문자열 비교가 곧 시각 비교다.
       // 파서가 형식을 검증하므로 여기서 다시 보지 않는다.
-      for (const row of result.page.rows) {
-        if (row.at >= lower && row.at <= upper) rows.push(row);
-      }
+      const kept = result.page.rows.filter((row) => row.at >= lower && row.at <= upper);
+      rows.push(...kept);
+      await options.onPage?.(kept, page);
     }
   }
 
@@ -300,9 +328,10 @@ export async function collect(
   accountNo: string,
   from: string,
   to: string,
+  options: CollectOptions = {},
 ): Promise<CollectResult> {
   const credentials = lookupCredentials(loginId, deps.env);
   if (credentials === undefined) throw new RangeError(`자격증명을 찾을 수 없다: ${loginId}`);
   const session = new CollectorSession({ transport: deps.transport, clock: deps.clock, credentials });
-  return session.collect(accountNo, from, to);
+  return session.collect(accountNo, from, to, options);
 }

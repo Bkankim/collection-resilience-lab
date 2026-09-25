@@ -318,6 +318,63 @@ describe('수집 세션: 기간과 전송', () => {
   });
 });
 
+describe('수집 세션: 받은 페이지부터 이어받기', () => {
+  const ledger = buildLedger(ACCOUNT.accountNo, ACCOUNT.txCount);
+
+  it('startPage 3이면 3페이지부터 받고, 행은 원장의 3페이지 이후와 같다', async () => {
+    const lab = await makeLab();
+    const pagesSent: string[] = [];
+    const transport = lab.transport((req) => {
+      if (req.path.startsWith('/transactions')) pagesSent.push(req.path.split('page=')[1]!);
+    });
+    const session = new CollectorSession({ transport, credentials: CREDS, clock: lab.clock });
+    const result = await session.collect(ACCOUNT.accountNo, '2026-01-01', '2026-12-31', { startPage: 3 });
+
+    expect(result).toMatchObject({ ok: true });
+    if (!result.ok) return;
+    // 한 페이지 20행(대상 서버 PAGE_SIZE)이라 1·2페이지는 원장의 앞 40행이다.
+    expect(result.rows).toEqual(ledger.slice(40));
+    // 137행은 7페이지이고, 끝을 확인하는 빈 8페이지까지 간다.
+    expect(pagesSent).toEqual(['3', '4', '5', '6', '7', '8']);
+  });
+
+  it('onPage는 받은 페이지마다 순서대로, 다음 페이지를 보내기 전에 불린다. 기간으로 전부 걸러진 페이지도 불린다', async () => {
+    const lab = await makeLab();
+    const trace: string[] = [];
+    const transport = lab.transport((req) => {
+      if (req.path.startsWith('/transactions')) trace.push(`fetch ${req.path.split('page=')[1]!}`);
+    });
+    // 기간은 3페이지(원장 40~59번째) 안쪽이다. 다른 페이지의 행은 전부 걸러진다.
+    const from = ledger[45]!.at;
+    const to = ledger[50]!.at;
+    const pages: { page: number; seqs: number[] }[] = [];
+    const result = await collect({ transport, clock: lab.clock, env: {} }, 'demo01', ACCOUNT.accountNo, from, to, {
+      startPage: 2,
+      onPage: async (rows, page) => {
+        // 한 틱 미뤄도 다음 페이지 요청이 끼어들지 않아야 한다(기다린 뒤 넘긴다).
+        await new Promise((r) => setTimeout(r, 5));
+        trace.push(`page ${page}`);
+        pages.push({ page, seqs: rows.map((r) => r.seq) });
+      },
+    });
+
+    expect(result).toMatchObject({ ok: true });
+    expect(pages).toEqual([
+      { page: 2, seqs: [] },
+      { page: 3, seqs: ledger.slice(45, 51).map((r) => r.seq) },
+      { page: 4, seqs: [] },
+      { page: 5, seqs: [] },
+      { page: 6, seqs: [] },
+      { page: 7, seqs: [] },
+    ]);
+    // 끝을 확인하는 빈 8페이지에는 부르지 않는다. 받은 행이 없다.
+    expect(trace).toEqual([
+      'fetch 2', 'page 2', 'fetch 3', 'page 3', 'fetch 4', 'page 4',
+      'fetch 5', 'page 5', 'fetch 6', 'page 6', 'fetch 7', 'page 7', 'fetch 8',
+    ]);
+  });
+});
+
 describe('수집 세션: 끝나지 않는 페이지 넘김을 막는다', () => {
   /** 인증은 통과시키고 거래내역은 `page`에 따라 만든 HTML을 주는 가짜 전송. */
   function fakeServer(render: (page: number) => string) {
@@ -357,5 +414,23 @@ describe('수집 세션: 끝나지 않는 페이지 넘김을 막는다', () => 
     const result = await session.collect(ACCOUNT.accountNo, '2026-01-01', '2026-12-31');
     expect(result).toMatchObject({ kind: 'UNKNOWN', detail: expect.stringContaining('totalPages + 1(3)') });
     expect(pageRequests).toEqual([1, 2, 3]);
+  });
+
+  it('이어받을 때도 요청과 다른 페이지를 주면 그 첫 페이지에서 UNKNOWN이다', async () => {
+    const { transport, pageRequests } = fakeServer(() => renderTransactionsHtml(selectPage(ACCOUNT.accountNo, ACCOUNT.txCount, 1)));
+    const session = new CollectorSession({ transport, credentials: CREDS, clock: () => START_MS });
+    const result = await session.collect(ACCOUNT.accountNo, '2026-01-01', '2026-12-31', { startPage: 3 });
+    expect(result).toMatchObject({ kind: 'UNKNOWN', detail: expect.stringContaining('요청 000-11-222333 3페이지, 응답 000-11-222333 1페이지') });
+    expect(pageRequests).toEqual([3]);
+  });
+
+  it('이어받을 때 상한은 이번에 처음 받은 페이지의 totalPages + 1이다', async () => {
+    // 2페이지 응답은 총 60건 = 3페이지라 상한이 4다. 1페이지를 받지 않았으므로 1페이지의
+    // totalPages(2)로는 잴 수 없다.
+    const { transport, pageRequests } = fakeServer((page) => renderTransactionsHtml(selectPage(ACCOUNT.accountNo, (page + 1) * 20, page)));
+    const session = new CollectorSession({ transport, credentials: CREDS, clock: () => START_MS });
+    const result = await session.collect(ACCOUNT.accountNo, '2026-01-01', '2026-12-31', { startPage: 2 });
+    expect(result).toMatchObject({ kind: 'UNKNOWN', detail: expect.stringContaining('totalPages + 1(4)') });
+    expect(pageRequests).toEqual([2, 3, 4]);
   });
 });
