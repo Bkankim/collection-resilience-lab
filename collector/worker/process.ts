@@ -216,7 +216,9 @@ export function createCollectionHandlers(deps: ProcessorDeps): CollectionHandler
       }
       // 표 바깥의 예외(결과 쓰기 중 Redis 오류 등). 일시적일 수 있어 BullMQ의 재시도에
       // 맡기고, 마지막 시도라면 분류 없이 DLQ에 남긴다. 남기지 않으면 원래 큐의 실패
-      // 목록에만 있고 DLQ에서는 보이지 않는다.
+      // 목록에만 있고 DLQ에서는 보이지 않는다. #19 뒤로는 페이지마다 쓰기(진행·결과·행 수·체크포인트)가
+      // 있어 작업 하나가 Redis에 쓰는 횟수가 페이지 수만큼 늘었고, 그만큼 이 경로를 만날 기회도 늘었다
+      // (#19 최종 리뷰 10, 의도한 동작).
       if (isLastAttempt(job)) throw await recordDead(error, job, jobId, null, error.message);
       log({ event: 'retry', jobId, attemptsMade: job.attemptsMade, kind: null, detail: error.message });
       thrown.add(error);
@@ -269,6 +271,11 @@ export function createCollectionHandlers(deps: ProcessorDeps): CollectionHandler
             // **행을 먼저, 체크포인트를 나중에 쓴다.** 둘 사이에 워커가 죽으면 다시 시작한 쪽이
             // 같은 페이지를 한 번 더 받아 같은 seq에 덮어쓸 뿐이다. 반대 순서면 체크포인트만
             // 넘어가고 그 페이지의 행이 영영 빠진다.
+            //
+            // 체크포인트 쓰기는 잠금을 확인하지 않고 앞으로만 가는지도 보지 않는다(#19 최종 리뷰 11). 잠금을
+            // 잃은 채 멈춰 있던 워커가 늦게 깨어나면 다른 워커가 앞으로 옮긴 체크포인트를 뒤로 덮을 수 있다.
+            // 결과는 seq 필드라 행은 잃지도 늘지도 않고, 다시 받는 요청과 진행 한 번이 더 세어질 뿐이다.
+            // 막으려면 BullMQ 잠금 토큰으로 쓰기를 거르는 스크립트가 필요해 두지 않았다.
             await writeResults(jobId, rows);
             const written = await redis.hlen(key);
             const cap = maxPage ?? checkpoint?.maxPage;
