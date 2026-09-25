@@ -12,8 +12,11 @@
 | 3 | 2a7622b (작업마다 센 상한) | 속도 제한 + 출발지 차단, 워커 2개에서 NO_PROGRESS 오탐 |
 | 4 | 6e2af48 (큐 전체로 센 상한) | 3절과 같은 조건에서 두 작업 모두 완료. 굶주림 |
 | 5 | 6e2af48 | N=2(로그인 비용 이하)에서 NO_PROGRESS |
+| 6 | fb9d6fa (리뷰 결함 수정) | 5절이 남긴 상태가 멀쩡한 큐를 실패시킨 것 등 세 결함, 4·5절 재실행 |
 
-2a7622b와 6e2af48의 이어받기 코드(페이지마다 결과·체크포인트)는 같습니다. 달라진 것은 상한을 세는 단위뿐입니다.
+2a7622b·6e2af48·fb9d6fa의 이어받기 코드(페이지마다 결과·체크포인트)는 같습니다. 달라진 것은 상한을 세는
+방법뿐입니다. **4·5절(6e2af48)의 상한에는 결함이 셋 있었고 6절에서 고쳤습니다.** 4·5절은 그 코드의 기록으로
+남깁니다.
 
 ## 실행 조건
 
@@ -338,20 +341,148 @@ pages 21  seen 21  cycles 3  until 1790339325782
   상한에 닿았습니다. 상태를 큐 전체로 두는 대가로, 앞선 작업의 진행이 다음 작업의 첫 주기에 넘어옵니다.
   CI 테스트(새 큐, `progress` 키 없음)에서는 세 번입니다.
 
+## 6. 리뷰 결함 수정(fb9d6fa): 지난 사고의 연속 수·완료·늦게 센 페이지
+
+빈 컨텍스트 리뷰가 6e2af48의 큐 전체 상한에서 셋을 찾았고, 리뷰 재현 스크립트(리포 밖, 워커를 같은
+프로세스에 띄우고 진행 키를 심는다)로 모두 재현됐습니다.
+
+| 결함 | 재현 | 6e2af48 | fb9d6fa |
+|---|---|---|---|
+| 1a. 지난 사고의 상태(5절 끝 pages 21 seen 21 cycles 3)를 이어받아, 회복된 큐의 첫 429에서 멀쩡한 작업이 실패 | `stale` | seed 없음 completed, seed 있음 failed("4번 연속") | 둘 다 completed |
+| 1b·1c. 받은 페이지를 결과·체크포인트를 쓴 뒤에 세고, 같은 정지 안에서는 진행을 다시 보지 않아 다른 워커의 429가 무진행으로 셈 | `race 3 seed3` | 3회 모두 두 작업 failed | 3회 모두 completed. `race 5 seed`(연속 2 심음)도 0/5 실패 |
+| 2. 페이지 없이 끝난 완료(빈 계좌 등)를 진행으로 세지 않음 | `completion` | completed completed failed failed failed | 5건 모두 completed |
+| 3. 체크포인트와 진행 세기 사이에 죽으면 진행을 잃음 | (재현 없음, 코드 읽기) | | 받자마자 세므로 닫힘 |
+
+고친 규칙(`process.ts` `DEFAULT_NO_PROGRESS_CYCLES`·`COUNT_CYCLE` 주석): 진행은 페이지를 받거나 작업을 완료한 것이고,
+페이지는 받자마자(결과를 쓰기 전에) 셉니다. 같은 정지 안에서도 앞선 제한 뒤에 진행이 있었으면 0입니다. 직전 정지가
+끝나고 60초가 지나 온 제한은 연속이 아니라 1부터 셉니다. 네 경우는 워커 테스트로 고정했고, 6e2af48의 process.ts로
+돌리면 네 테스트 모두 실패합니다.
+
+### 6-1. 재실행 준비: 남아 있던 진행 키 하나를 지웠다
+
+5절이 남긴 `progress:collections`가 바로 결함 1a의 상태라, 재실행 전에 **그 키 하나만** 지웠습니다. 큐의 작업·결과·
+DLQ는 그대로 두고, 작업 ID가 겹치지 않게 기간을 바꿨습니다.
+
+```sh
+$ docker compose exec -T redis redis-cli hgetall progress:collections
+pages 21  seen 21  cycles 3  until 1790339325782
+$ docker compose exec -T redis redis-cli del progress:collections
+1
+$ docker compose exec -T redis redis-cli llen bull:collections-dead:wait
+2
+```
+
+대상 서버·API·워커 2개를 fb9d6fa 코드(7672244, 뒤 커밋은 테스트만 더함)로 새로 띄웠습니다. 조건은 실행 조건 표와 같습니다.
+
+### 6-2. 속도 제한 + 출발지 차단, 기본값, 워커 2개, demo01 2건
+
+4절과 같은 조건, 작업은 `from 2026-01-11`, `from 2026-01-12`.
+
+```sh
+$ ./run.sh blk2 '{"switches":{"rateLimit":true,"ipBlock":true,"sessionExpiry":false},"thresholds":{"windowSec":10,"maxRequests":5,"blockAfter":3,"blockDurationSec":30,"sessionTtlSec":60}}' 2026-01-11 2026-01-12
+{"id":"col_d591f811334c867c0def8204e64a7523","status":"running"}
+{"id":"col_85e077b799509dc3b1ca7086d7dd16aa","status":"queued"}
+elapsed 211s
+$ ./events.sh blk2          # 앞부분과 끝
+13:10:42.542 w1 rate-limited dd16aa RATE_LIMITED 10000
+13:10:42.546 w2 rate-limited 4a7523 RATE_LIMITED 10000
+13:10:52.576 w1 rate-limited 4a7523 IP_BLOCKED 30000
+13:10:52.581 w2 rate-limited dd16aa IP_BLOCKED 30000
+...(30초·10초 간격으로 두 작업이 같이 제한을 받는 줄이 이어짐)
+13:13:22.772 w1 rate-limited 4a7523 RATE_LIMITED 10000
+13:13:22.775 w2 completed dd16aa   97
+13:13:32.801 w1 rate-limited 4a7523 RATE_LIMITED 10000
+13:13:42.850 w1 rate-limited 4a7523 IP_BLOCKED 30000
+13:14:12.878 w2 completed 4a7523   101
+$ # 요청 묶음마다(첫 요청 ms, lo=/login au=/auth/otp, 숫자=거래내역 페이지)
+0      lo(200) au(200) 1(200) lo(200) au(200) 1(429) 2(429)
+10056  lo(200) lo(200) au(200) au(200) 1(200) 2(403) 2(403)
+40092  lo(200) lo(200) au(200) au(200) 2(200) 2(429) 3(429)
+50140  lo(200) lo(200) au(200) au(200) 3(200) 2(403) 4(403)
+80158  lo(200) lo(200) au(200) au(200) 4(200) 2(429) 5(429)
+90181  lo(200) au(200) lo(200) 5(200) au(200) 2(403) 6(403)
+120214 lo(200) lo(200) au(200) au(200) 6(200) 2(429) 7(429)
+130232 lo(200) lo(200) au(200) au(200) 7(200) 2(403) 8(403)
+160256 lo(200) lo(200) au(200) au(200) 8(200) 2(429)
+170269 lo(200) au(200) 2(200) 3(200) 4(200) 5(429)
+180313 lo(200) au(200) 5(200) 6(200) 7(200) 8(403)
+210359 lo(200) au(200) 8(200)
+$ tsx ledger-check.mts ... (두 작업)
+{"status":"completed","count":101,"rows":101,"expected":101,"equal":true}
+{"status":"completed","count":97,"rows":97,"expected":97,"equal":true}
+$ docker compose exec -T redis redis-cli hgetall progress:collections
+seen 15  cycles 0  until 1790342052849  pages 16
+$ docker compose exec -T redis redis-cli llen bull:collections-dead:wait
+2
+```
+
+- 두 작업 모두 완료, 원장과 일치, DLQ 추가 0건입니다. 211초, 큐 정지 11번(429로 10초 6번, 403 차단으로 30초 5번.
+  6×10 + 5×30 = 210초). 요청 묶음 12개 모두에 200을 받은 페이지가 있습니다.
+- **굶주림은 4절보다 길었습니다.** 4a7523(`from 2026-01-11`)은 첫 묶음에 1페이지를 받은 뒤 2페이지 요청이
+  10056~160256ms의 여덟 묶음 동안 429·403이었습니다(약 150초). 그동안 dd16aa가 묶음마다 한 페이지씩 받았습니다.
+  dd16aa가 끝난 뒤 창을 혼자 쓰며 두 묶음에 3페이지씩 받아 끝났습니다. 고친 코드도 공정성은 다루지 않습니다.
+
+### 6-3. N=2, demo01 1건
+
+6-2가 끝나고 20초 뒤(직전 정지가 끝난 13:14:12에서 60초 안) 시작했습니다. `from 2026-01-13`.
+
+```sh
+$ date -u +%H:%M:%S; docker compose exec -T redis redis-cli hgetall progress:collections
+13:14:32
+seen 15  cycles 0  until 1790342052849  pages 16
+$ ./run.sh n2b '{"switches":{"rateLimit":true,"ipBlock":false,"sessionExpiry":false},"thresholds":{"windowSec":10,"maxRequests":2,"blockAfter":3,"blockDurationSec":30,"sessionTtlSec":60}}' 2026-01-13
+{"id":"col_9c89a62b77eec5058366bd417bbf915f","status":"queued"}
+elapsed 31s
+$ ./events.sh n2b
+13:14:32.773 w2 rate-limited bf915f RATE_LIMITED 10000
+13:14:42.794 w1 rate-limited bf915f RATE_LIMITED 10000
+13:14:52.809 w1 rate-limited bf915f RATE_LIMITED 10000
+13:15:02.823 w1 rate-limited bf915f RATE_LIMITED 10000
+13:15:02.830 w1 dead-letter bf915f NO_PROGRESS   큐 전체에서 속도 제한·차단 주기 3번 연속 새 페이지 없음(이 작업은 1페이지에서 멈춤). ...
+      0 /login            200
+      1 /auth/otp         200
+      1 /transactions  1  429
+  10016 /login            200
+  10020 /auth/otp         200
+  10022 /transactions  1  429
+  20034 /login            200
+  20036 /auth/otp         200
+  20036 /transactions  1  429
+  30047 /login            200
+  30049 /auth/otp         200
+  30050 /transactions  1  429
+$ curl -s localhost:8090/collections/col_9c89a62b77eec5058366bd417bbf915f
+{"id":"col_9c89a62b77eec5058366bd417bbf915f","status":"failed","request":{"loginId":"demo01","accountNo":"000-11-222333","from":"2026-01-13 00:00:00","to":"2026-09-01 23:59:59"},"attemptsMade":1,"failure":{"kind":"NO_PROGRESS","detail":"큐 전체에서 속도 제한·차단 주기 3번 연속 새 페이지 없음(이 작업은 1페이지에서 멈춤). ..."}}
+$ docker compose exec -T redis redis-cli hgetall progress:collections
+seen 16  cycles 3  until 1790342112818  pages 16
+$ docker compose exec -T redis redis-cli llen bull:collections-dead:wait
+3
+```
+
+- N=2는 여전히 NO_PROGRESS로 DLQ에 갑니다. 429는 이번에도 네 번입니다. 직전 정지가 끝난 지 60초가 안 돼 연속이
+  이어졌고, 6-2의 마지막 완료(4a7523, `pages` 16 > `seen` 15)가 첫 주기의 진행으로 세어졌습니다. 완료도 진행으로
+  센다는 고친 규칙 그대로입니다. 60초가 지난 뒤 시작했거나 앞 실행이 없었으면 세 번입니다(CI 테스트).
+- 남은 `progress:collections`는 cycles 3입니다. 60초 안에 멀쩡한 작업이 429를 받으면 5절과 같은 일이 생길 수
+  있지만, 60초가 지나면 다음 제한은 1부터 셉니다(6절 결함 1a 수정).
+- DLQ 메시지의 "새 페이지 없음"은 지금 규칙(페이지나 완료)보다 좁은 말입니다. 문구는 고치지 않았습니다.
+- 끝나고 네 프로세스(대상 서버·API·워커 2개)는 띄울 때 적은 PID로만 내렸고 포트는 비었습니다.
+
 ## 정리
 
-| 조건 | 이어받기 전(1158b74) | 작업마다 센 상한(2a7622b) | 큐 전체로 센 상한(6e2af48) |
-|---|---|---|---|
-| 속도 제한, W=10 N=5, demo01 1건 | 40초 동안 다섯 주기 모두 4페이지에서 막혀 `queued` | 20초에 완료, 137행 원장 일치 | 20초에 완료, 117행 원장 일치 |
-| 속도 제한 + 차단, 기본값, 워커 2개, demo01 2건 | (재지 않음) | 1건 NO_PROGRESS 오탐(큐는 주기마다 나아감), 1건 완료 | 2건 모두 완료(201초), DLQ 0건 추가. 1건이 여섯 주기 굶음 |
-| N=2, demo01 1건 | (재지 않음) | (실측 안 함, CI만) | 429 네 번 뒤 NO_PROGRESS |
+| 조건 | 이어받기 전(1158b74) | 작업마다 센 상한(2a7622b) | 큐 전체로 센 상한(6e2af48) | 리뷰 수정(fb9d6fa) |
+|---|---|---|---|---|
+| 속도 제한, W=10 N=5, demo01 1건 | 40초 동안 다섯 주기 모두 4페이지에서 막혀 `queued` | 20초에 완료, 137행 원장 일치 | 20초에 완료, 117행 원장 일치 | (다시 재지 않음. 이어받기 코드는 같다) |
+| 속도 제한 + 차단, 기본값, 워커 2개, demo01 2건 | (재지 않음) | 1건 NO_PROGRESS 오탐(큐는 주기마다 나아감), 1건 완료 | 2건 모두 완료(201초). 1건이 여섯 주기 굶음 | 2건 모두 완료(211초). 1건이 여덟 주기 굶음 |
+| N=2, demo01 1건 | (재지 않음) | (실측 안 함, CI만) | 429 네 번 뒤 NO_PROGRESS. 끝 상태 cycles 3이 남음 | 429 네 번 뒤 NO_PROGRESS(앞 실행의 완료가 첫 주기 진행) |
+| 5절 끝 상태(cycles 3) 위의 멀쩡한 작업 | | | 첫 429에 NO_PROGRESS(리뷰 재현) | 60초 지난 연속은 끊겨 완료(리뷰 재현, 워커 테스트) |
 
 - 끝나지 않던 것은 풀렸습니다. 창보다 큰 작업이 받은 페이지부터 이어받아 끝납니다.
 - 로그인 비용 이하 창은 NO_PROGRESS로 DLQ에 남습니다. 시도 횟수는 깎지 않았습니다.
-- 남는 것: 굶주림(4절), 첫 주기가 앞선 작업의 진행을 넘겨받는 것(5절), 세션 재사용 없음(매 주기 로그인
-  2요청, 이슈 #19의 안 하는 것).
-- 끝나고 대상 서버·API·워커는 띄울 때 적어 둔 PID로만 내렸고 포트 8081·8090은 비었습니다. 큐
-  `collections`의 작업·결과·DLQ(2건)·`progress:collections`는 지우지 않았습니다.
+- 남는 것: 굶주림(4절 여섯 주기, 6-2 여덟 주기), 60초 안에 시작한 다음 실행의 첫 주기가 앞선 진행을 넘겨받는
+  것(5절, 6-3), 페이지를 받은 뒤 진행을 세는 한 번 왕복보다 짧은 경쟁(fb9d6fa 커밋의 Not-tested), 세션 재사용
+  없음(매 주기 로그인 2요청, 이슈 #19의 안 하는 것).
+- 프로세스는 띄울 때 적어 둔 PID로만 내렸습니다. 큐 `collections`에서 지운 것은 6-1의 `progress:collections` 키
+  하나뿐입니다. 작업·결과·DLQ(3건)는 남아 있습니다.
 
 ## 부록: 스크립트
 
