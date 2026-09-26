@@ -6,8 +6,8 @@
  * 처리했는지와, 속도 제한 동안 두 워커가 모두 멈췄는지를 로그만으로 볼 수 있다.
  *
  * 환경변수:
- * - `TARGET_ORIGIN`: 대상 서버. 기본 `http://127.0.0.1:8080`. 프록시를 쓰면 **프록시가 보는** 주소다
- *   (compose면 `http://target:8080`).
+ * - `TARGET_ORIGIN`: 대상 서버. 기본 `http://127.0.0.1:8080`. 프록시를 쓰면 **프록시가 보는** 주소이고 필수다
+ *   (compose면 `http://target:8080`). 없으면 시작할 때 던진다(`resolveTargetOrigin`).
  * - `WORKER_PROXIES`: 출발지 프록시 목록(#14). 쉼표로 나눈 주소, 예 `http://127.0.0.1:3128,http://127.0.0.1:3129`.
  *   목록 순서가 고르는 순서다. 비우면 프록시 없이 직접 보낸다(출발지 하나, IP_BLOCKED는 기다린다). 규칙은
  *   `client/origins.ts` 머리 주석.
@@ -25,7 +25,7 @@
 import { Queue } from 'bullmq';
 
 import { systemClock } from '../client/clock.js';
-import { OriginPool, createProxyOrigins, parseProxyList } from '../client/origins.js';
+import { OriginPool, createProxyOrigins, parseProxyList, resolveTargetOrigin } from '../client/origins.js';
 import { collect } from '../client/session.js';
 import { createUndiciTransport } from '../client/transport.js';
 import { COLLECTION_QUEUE, createRedis, deadLetterQueueName } from '../queue.js';
@@ -34,7 +34,6 @@ import { DEFAULT_NO_PROGRESS_CYCLES, DEFAULT_WORKER_LIMITER, createCollectionWor
 import type { WorkerEvent } from './process.js';
 
 const name = nonBlank(process.env.WORKER_NAME) ?? `worker-${process.pid}`;
-const origin = nonBlank(process.env.TARGET_ORIGIN) ?? 'http://127.0.0.1:8080';
 const queueName = nonBlank(process.env.QUEUE_NAME) ?? COLLECTION_QUEUE;
 const concurrency = positiveInt('WORKER_CONCURRENCY', 1);
 const limiter = {
@@ -43,6 +42,7 @@ const limiter = {
 };
 const noProgressCycles = positiveInt('WORKER_NO_PROGRESS_CYCLES', DEFAULT_NO_PROGRESS_CYCLES);
 const proxies = parseProxyList(process.env.WORKER_PROXIES);
+const origin = resolveTargetOrigin(process.env.TARGET_ORIGIN, proxies);
 
 function print(record: Record<string, unknown>): void {
   console.log(JSON.stringify({ t: new Date().toISOString(), worker: name, pid: process.pid, ...record }));

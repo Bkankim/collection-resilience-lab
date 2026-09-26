@@ -71,10 +71,11 @@ export class OriginPool {
     return this.#earliest().origin;
   }
 
-  /** `untilMs`까지 후보에서 뺀다. 이미 더 늦게까지 막혀 있으면 줄이지 않는다. */
-  block(origin: Origin, untilMs: number): void {
+  /** `untilMs`까지 후보에서 뺀다. 이미 더 늦게까지 막혀 있으면 줄이지 않는다. 실제로 남은 해제 시각을 돌려준다. */
+  block(origin: Origin, untilMs: number): number {
     const entry = this.#entry(origin);
     entry.blockedUntil = Math.max(entry.blockedUntil, untilMs);
+    return entry.blockedUntil;
   }
 
   /** 가장 빨리 풀리는 시각(ms). 이미 풀린 출발지가 있으면 지금 이하다. */
@@ -114,18 +115,39 @@ export class OriginPool {
 export function parseProxyList(raw: string | undefined): string[] {
   if (raw === undefined || raw.trim() === '') return [];
   const proxies = raw.split(',').map((part) => part.trim());
-  for (const proxy of proxies) {
+  // 오류 메시지에는 몇 번째 항목인지와 이유만 싣고 원문의 어느 조각도 싣지 않는다. 자격증명이 든 값(`user:pass@host`,
+  // `socks5://user:pass@host`, `TOKEN:@host`처럼 스킴 자리에 비밀이 온 값)이 자격증명 검사에 닿기 전에 앞의 검사에서
+  // 걸리면 원문째, 또는 스킴·호스트 조각으로 로그에 남는다(final-review #1).
+  for (const [i, proxy] of proxies.entries()) {
     let url: URL;
     try {
       url = new URL(proxy);
     } catch {
-      throw new RangeError(`프록시 주소가 URL이 아니다: ${JSON.stringify(proxy)}`);
+      throw new RangeError(`WORKER_PROXIES ${i + 1}번째 항목이 URL이 아니다`);
     }
-    if (url.protocol !== 'http:' && url.protocol !== 'https:') throw new RangeError(`프록시는 http 또는 https여야 한다: ${proxy}`);
-    if (url.username !== '' || url.password !== '') throw new RangeError(`프록시 주소에 자격증명을 싣지 않는다(로그에 이름으로 찍힌다): ${url.host}`);
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') throw new RangeError(`WORKER_PROXIES ${i + 1}번째 항목이 http 또는 https가 아니다`);
+    if (url.username !== '' || url.password !== '') throw new RangeError(`WORKER_PROXIES ${i + 1}번째 항목에 자격증명이 실렸다(로그에 이름으로 찍히므로 싣지 않는다)`);
   }
-  if (new Set(proxies).size !== proxies.length) throw new RangeError(`프록시 주소가 겹친다: ${proxies.join(', ')}`);
+  const first = new Map<string, number>();
+  for (const [i, proxy] of proxies.entries()) {
+    const seen = first.get(proxy);
+    if (seen !== undefined) throw new RangeError(`WORKER_PROXIES ${i + 1}번째 항목이 ${seen + 1}번째 항목과 같다`);
+    first.set(proxy, i);
+  }
   return proxies;
+}
+
+export const DEFAULT_TARGET_ORIGIN = 'http://127.0.0.1:8080';
+
+/**
+ * `TARGET_ORIGIN`을 읽는다. 프록시가 없으면 비었을 때 기본값(호스트에서 띄운 대상 서버)이다. **프록시가 있으면 반드시
+ * 받는다.** 대상 서버 주소는 프록시가 푸는데, 기본값 127.0.0.1은 프록시 컨테이너 안에서 프록시 자신이라 요청이 전부
+ * 5xx(TRANSIENT)로 재시도하다 DLQ로 가고 전환은 한 번도 일어나지 않는다. 설정 오류는 워커를 시작할 때 드러낸다.
+ */
+export function resolveTargetOrigin(raw: string | undefined, proxies: readonly string[]): string {
+  if (raw !== undefined && raw.trim() !== '') return raw;
+  if (proxies.length > 0) throw new RangeError('WORKER_PROXIES를 주면 TARGET_ORIGIN도 줘야 한다(프록시가 보는 대상 서버 주소, compose면 http://target:8080)');
+  return DEFAULT_TARGET_ORIGIN;
 }
 
 export type ProxyOrigins = { origins: Origin[]; close: () => Promise<void> };

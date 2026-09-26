@@ -51,6 +51,8 @@ export type WorkerEvent =
   | { event: 'origin-result'; jobId: string; origin: string; outcome: 'ok' | FailureKind; ok: number; failed: number }
   /** IP_BLOCKED를 받아 다른 출발지로 바꿨다. 큐는 멈추지 않았고 시도 횟수도 쓰지 않았다. */
   | { event: 'origin-rotated'; jobId: string; from: string; to: string; blockedUntil: string; detail: string }
+  /** 다른 출발지가 있지만 다른 워커의 속도 제한으로 큐가 멈춰 있어 바꾸지 않았다. 남은 정지만큼 멈춘다(뒤따르는 `rate-limited`). */
+  | { event: 'origin-rotation-held'; jobId: string; from: string; to: string; waitMs: number }
   /** 출발지가 모두 막혔다. 가장 빨리 풀리는 시각까지 큐 전체를 멈춘다(뒤따르는 `rate-limited`). */
   | { event: 'origins-exhausted'; jobId: string; waitMs: number; releases: { origin: string; blockedUntil: string | null }[] };
 
@@ -247,15 +249,7 @@ export function createCollectionHandlers(deps: ProcessorDeps): CollectionHandler
     const data = job.data;
 
     // 차단기는 수집보다 먼저 본다. 여기를 지나면 로그인 요청이 나간다.
-    const blocked = await redis.get(authBlockKey(queue.name, data.loginId));
-    if (blocked !== null) {
-      log({ event: 'auth-blocked', jobId, loginId: data.loginId });
-      const kind = blockedKind(blocked);
-      const detail =
-        `차단기: ${data.loginId}는 이전 작업의 ${kind}로 막혀 있어 로그인하지 않았다(${blocked}). ` +
-        `자격증명을 고친 뒤 ${authBlockKey(queue.name, data.loginId)} 키를 지우고, 이 작업을 다시 돌리거나 지워야 한다`;
-      throw await recordDead(new UnrecoverableError(formatFailedReason(kind, detail)), job, jobId, kind, detail);
-    }
+    await checkAuthBlock(job, jobId);
 
     // 결과 저장소의 수명 규칙(#19 최종 리뷰 1·12). 1페이지부터 받는 실행은 같은 작업 ID의 옛 결과를
     // 먼저 지운다. 남겨 두면 작업을 지우고 다시 넣었을 때 옛 실행의 행이 건수와 결과에 섞인다. 이어받는
@@ -275,6 +269,16 @@ export function createCollectionHandlers(deps: ProcessorDeps): CollectionHandler
     }
 
     const origins = deps.origins;
+    // 처리를 시작할 때 이 프로세스가 아는 출발지가 모두 막혀 있으면 로그인을 보내지 않고 곧바로 가장 빨리 풀리는
+    // 출발지까지 큐를 멈춘다(final-review #6). 보내 봐야 확정적인 403이고, 차단 중인 출발지에 요청을 더한다.
+    // concurrency가 2 이상이거나 다른 워커의 짧은 정지가 앞선 정지를 덮어쓴 경우에 생긴다.
+    if (origins !== undefined && origins.available() === undefined) {
+      const now = clock();
+      const waitMs = Math.max(1, origins.earliestRelease() - now);
+      logExhausted(jobId, origins, waitMs, now);
+      const detail = `출발지 ${origins.size}개가 모두 막혀 있어 보내지 않았다`;
+      return dispose(job, jobId, { ok: false, kind: 'IP_BLOCKED', detail, retryAfterSec: waitMs / 1000 }, waitMs);
+    }
     let origin = origins?.pick();
     let rotations = 0;
     let exhaustedWaitMs: number | undefined;
@@ -339,11 +343,22 @@ export function createCollectionHandlers(deps: ProcessorDeps): CollectionHandler
 
       // 차단된 출발지는 대상 서버가 준 Retry-After가 끝날 때까지 뺀다. 고르는 기준은 이 해제 시각뿐이다.
       const now = clock();
-      origins.block(origin, now + waitMsOf(result));
+      // 로그에는 풀이 실제로 든 해제 시각을 싣는다. 같은 출발지를 다른 작업이 더 길게 막아 두었으면 그쪽이다.
+      const blockedUntil = origins.block(origin, now + waitMsOf(result));
       const next = rotations + 1 < origins.size ? origins.available() : undefined;
       if (next !== undefined) {
+        // 다른 워커가 속도 제한으로 큐를 멈춰 두었으면 바꾸지 않는다. 처리 안의 전환은 BullMQ로 돌아가지 않으므로
+        // 그대로 두면 큐 정지 중에 새 출발지로 로그인·페이지가 나가, 속도 제한을 출발지 전환으로 비켜 가게 된다
+        // (final-review #5). 남은 정지만큼 큐 정지 경로로 보낸다. 같은 창 안이면 `COUNT_CYCLE`이 같은 주기로 친다.
+        const pausedMs = await queuePauseMs();
+        if (pausedMs > 0) {
+          exhaustedWaitMs = pausedMs;
+          log({ event: 'origin-rotation-held', jobId, from: origin.name, to: next.name, waitMs: pausedMs });
+          break;
+        }
+        await checkAuthBlock(job, jobId);
         rotations += 1;
-        log({ event: 'origin-rotated', jobId, from: origin.name, to: next.name, blockedUntil: new Date(now + waitMsOf(result)).toISOString(), detail: result.detail });
+        log({ event: 'origin-rotated', jobId, from: origin.name, to: next.name, blockedUntil: new Date(blockedUntil).toISOString(), detail: result.detail });
         origin = next;
         checkpoint = job.data.checkpoint;
         continue;
@@ -351,12 +366,7 @@ export function createCollectionHandlers(deps: ProcessorDeps): CollectionHandler
       // 모두 막혔다. 이 작업의 Retry-After가 아니라 가장 빨리 풀리는 출발지까지 큐 전체를 멈춘다. 그 뒤는 D2와 같은
       // 길이다(주기 세기 `COUNT_CYCLE`, 진행 기반 상한). DLQ로는 NO_PROGRESS로만 간다.
       exhaustedWaitMs = Math.max(1, origins.earliestRelease() - now);
-      log({
-        event: 'origins-exhausted',
-        jobId,
-        waitMs: exhaustedWaitMs,
-        releases: origins.states().map((o) => ({ origin: o.name, blockedUntil: o.blockedUntil === null ? null : new Date(o.blockedUntil).toISOString() })),
-      });
+      logExhausted(jobId, origins, exhaustedWaitMs, now);
       break;
     }
 
@@ -374,6 +384,41 @@ export function createCollectionHandlers(deps: ProcessorDeps): CollectionHandler
       return { count };
     }
     return dispose(job, jobId, result, exhaustedWaitMs);
+  }
+
+  /**
+   * 자격증명 차단기(`authBlockKey`)가 걸려 있으면 로그인하지 않고 DLQ로 끝낸다(던진다). 처리를 시작할 때, 그리고
+   * 출발지를 바꿔 다시 수집하기 직전마다 본다(#14). 전환은 로그인을 다시 보내므로, 앞 시도가 도는 동안 같은
+   * 로그인 ID의 다른 작업이 AUTH_FAILED로 차단기를 걸었으면 틀린 비밀번호가 한 번 더 나간다(final-review #3).
+   */
+  async function checkAuthBlock(job: Job<CollectionJobData>, jobId: string): Promise<void> {
+    const { loginId } = job.data;
+    const blocked = await redis.get(authBlockKey(queue.name, loginId));
+    if (blocked === null) return;
+    log({ event: 'auth-blocked', jobId, loginId });
+    const kind = blockedKind(blocked);
+    const detail =
+      `차단기: ${loginId}는 이전 작업의 ${kind}로 막혀 있어 로그인하지 않았다(${blocked}). ` +
+      `자격증명을 고친 뒤 ${authBlockKey(queue.name, loginId)} 키를 지우고, 이 작업을 다시 돌리거나 지워야 한다`;
+    throw await recordDead(new UnrecoverableError(formatFailedReason(kind, detail)), job, jobId, kind, detail);
+  }
+
+  /**
+   * 다른 워커가 속도 제한으로 건 큐 정지가 남은 시간(ms). 없으면 0. `queue.rateLimit`은 limiter 키를
+   * `Number.MAX_SAFE_INTEGER`로 두므로(bullmq 6.3.8 `setRateLimit`) 그 값으로 물으면 limiter가 평소에 세는 작업 수와
+   * 섞이지 않는다(`getRateLimitTtl` 스크립트는 키 값이 maxJobs 이상일 때만 PTTL을 준다).
+   */
+  async function queuePauseMs(): Promise<number> {
+    return Math.max(0, await queue.getRateLimitTtl(Number.MAX_SAFE_INTEGER));
+  }
+
+  function logExhausted(jobId: string, origins: OriginPool, waitMs: number, now: number): void {
+    log({
+      event: 'origins-exhausted',
+      jobId,
+      waitMs,
+      releases: origins.states().map((o) => ({ origin: o.name, blockedUntil: o.blockedUntil === null || o.blockedUntil <= now ? null : new Date(o.blockedUntil).toISOString() })),
+    });
   }
 
   /** 큐 전체의 진행을 하나 센다(`progressKey`의 `pages`, `COUNT_CYCLE`). */
