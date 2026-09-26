@@ -137,6 +137,10 @@ type ScenarioResult = {
   rotations: number;
   exhausted: number;
   pauses: number;
+  /** `origin-rotation-held`: 큐가 멈춰 있어 전환을 미룬 수(#14). */
+  held: number;
+  /** 위 칸에 없는 워커 사건(재시도 등)의 종류별 수. */
+  otherEvents: Record<string, number>;
   targetOrigins: Record<string, number>;
   requests: number;
 };
@@ -356,12 +360,25 @@ async function runScenario(
     rotations: count('origin-rotated'),
     exhausted: count('origins-exhausted'),
     pauses: count('rate-limited'),
+    held: count('origin-rotation-held'),
+    otherEvents: otherEventsOf(workerEvents),
     targetOrigins,
     requests: relayEvents.length,
   };
   events.push({ scenario: scenario.key, src: 'runner', t: new Date().toISOString(), event: 'summary', ...summaryOf(result) });
   say(`${scenario.name} 끝: 완료 ${result.completed} 실패 ${result.failed} DLQ ${result.dlq} ${((endedAt - startedAt) / 1000).toFixed(1)}초${timedOut ? ' (시간 초과)' : ''}`);
   return result;
+}
+
+const TABLED_EVENTS = new Set(['ready', 'shutdown', 'closed', 'completed', 'dead-letter', 'origin-result', 'origin-rotated', 'origins-exhausted', 'rate-limited', 'origin-rotation-held']);
+
+function otherEventsOf(workerEvents: readonly Event[]): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const e of workerEvents) {
+    const name = String(e.event);
+    if (!TABLED_EVENTS.has(name)) out[name] = (out[name] ?? 0) + 1;
+  }
+  return out;
 }
 
 function summaryOf(r: ScenarioResult): Record<string, unknown> {
@@ -424,7 +441,7 @@ function render(results: ScenarioResult[]): string {
     ]),
   );
   const detail = markdownTable(
-    ['시나리오', '완료 / 실패 / DLQ', 'DLQ 종류', '실패 응답(상태별)', '세션 만료 응답', '로그인 요청', '출발지 전환', '모두 막힘', '큐 정지', '결과 = 원장', '대상 서버가 본 출발지'],
+    ['시나리오', '완료 / 실패 / DLQ', 'DLQ 종류', '실패 응답(상태별)', '세션 만료 응답', '로그인 요청', '출발지 전환', '전환 보류', '모두 막힘', '큐 정지', '기타 워커 사건', '결과 = 원장', '대상 서버가 본 출발지'],
     results.map((r) => [
       r.scenario.name,
       `${r.completed} / ${r.failed} / ${r.dlq}`,
@@ -433,8 +450,10 @@ function render(results: ScenarioResult[]): string {
       String(r.sessionExpired),
       `${r.logins} (작업 수 대비 +${r.logins - JOBS})`,
       String(r.rotations),
+      String(r.held),
       String(r.exhausted),
       String(r.pauses),
+      kinds(r.otherEvents),
       `${r.resultsMatch.matched}/${r.resultsMatch.total}`,
       Object.entries(r.targetOrigins).map(([a, n]) => `${a} ${n}`).join(', ') || '-',
     ]),
@@ -476,7 +495,7 @@ ${why}
   "실패 응답 구간"(첫 실패 응답부터 마지막 실패 응답까지)이 보인다.
 - **처리량** = 완료 작업 수 / 소요 시간. 소요 시간은 첫 작업을 넣기 직전부터 마지막 작업이 끝난 사건(\`completed\`·\`dead-letter\`)까지.
 - 실패 응답(상태별)·세션 만료 응답·로그인 요청은 중계가 본 응답 수다. 502는 중계가 upstream에 닿지 못해 만든 응답이고 \`events.jsonl\`에 \`relayError\`가 붙는다. 세션 만료 응답은 401 + \`X-Session-Expired\`.
-- 출발지 전환 = 워커 \`origin-rotated\` 수, 모두 막힘 = \`origins-exhausted\` 수, 큐 정지 = \`rate-limited\` 수(워커가 큐 전체를 멈춘 횟수. 두 워커가 같은 순간 각각 멈추면 2).
+- 출발지 전환 = 워커 \`origin-rotated\` 수, 전환 보류 = \`origin-rotation-held\` 수(큐가 멈춰 있어 전환을 미룸), 기타 워커 사건 = 표의 다른 칸에 없는 워커 사건(\`retry\` 등)의 종류별 수, 모두 막힘 = \`origins-exhausted\` 수, 큐 정지 = \`rate-limited\` 수(워커가 큐 전체를 멈춘 횟수. 두 워커가 같은 순간 각각 멈추면 2).
 - 결과 = 원장: 완료 작업마다 결과 해시 행 수(HLEN)가 대상 서버 원장의 그 기간 행 수와 같은 작업 수 / 완료 작업 수.
 - 대상 서버가 본 출발지: 그 구간 대상 서버 로그의 수집 요청 \`remoteAddress\`별 수(관리 API·health 제외). 로그 시각은 VM 시계(호스트보다 0.1~0.2초 앞섬)라 앞뒤 0.5초를 더 본다.
 - M(blockAfter)에는 기간이 없다. 차단 해제나 설정 변경 전까지 429가 누적된다(\`target/switches.ts\`).
