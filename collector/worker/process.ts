@@ -3,10 +3,11 @@
  *
  * 실패에 무엇을 던질지는 `queue.ts`의 `DISPOSITION` 표만 따른다. 워커가 따로 판단하면
  * 표와 코드가 어긋나고, 어긋난 쪽이 AUTH_FAILED를 세 번 돌려 계정을 잠근다(#12 리뷰 재현).
- * 이 파일이 표에 없는 판단을 하는 곳은 네 군데다. 자격증명 차단기(작업을 가로질러 봐야 해서
+ * 이 파일이 표에 없는 판단을 하는 곳은 다섯 군데다. 자격증명 차단기(작업을 가로질러 봐야 해서
  * 표 한 칸으로 표현이 안 된다), 분류되지 않은 예외(표 바깥의 실패), BullMQ가 프로세서 밖에서
- * 실패시킨 작업(`onFailed`), 그리고 진행 기반 상한(NO_PROGRESS, #19)이다. 마지막 것은 응답
- * 하나가 아니라 큐 전체의 여러 주기를 가로질러 보는 판단이라 표에 칸이 없다.
+ * 실패시킨 작업(`onFailed`), 진행 기반 상한(NO_PROGRESS, #19), 그리고 출발지 전환(#14)이다. 진행 기반
+ * 상한은 응답 하나가 아니라 큐 전체의 여러 주기를 가로질러 보는 판단이라 표에 칸이 없다. 출발지 전환은
+ * 처분 표에 가기 **전에** 한다. 다른 출발지가 남아 있으면 IP_BLOCKED는 처분 표까지 가지 않는다(`run`).
  *
  * 의존성(수집 함수, Redis, 큐, 시계)을 주입받는다. 테스트가 실제 대상 서버를 붙이거나,
  * 대상 서버로는 만들기 어려운 실패(세션 토큰이 실린 UNKNOWN)를 가짜 수집 함수로 넣는다.
@@ -21,6 +22,7 @@ import type { ClassifyInput, Failure } from '../client/classify.js';
 import { DEFAULT_RATE_LIMIT_WAIT_SEC } from '../client/classify.js';
 import type { Clock } from '../client/clock.js';
 import type { FailureKind } from '../client/errors.js';
+import type { Origin, OriginPool } from '../client/origins.js';
 import type { CollectOptions, CollectResult } from '../client/session.js';
 import {
   DISPOSITION,
@@ -44,15 +46,26 @@ export type WorkerEvent =
   | { event: 'progress-count-error'; jobId: string; detail: string }
   | { event: 'resume-reset'; jobId: string; detail: string }
   | { event: 'auth-block-error'; jobId: string; detail: string }
-  | { event: 'auth-blocked'; jobId: string; loginId: string };
+  | { event: 'auth-blocked'; jobId: string; loginId: string }
+  /** 출발지를 쓴 수집 한 번의 결과와 그 출발지의 누적 성공·실패 수(#14, 측정 #15가 쓴다). */
+  | { event: 'origin-result'; jobId: string; origin: string; outcome: 'ok' | FailureKind; ok: number; failed: number }
+  /** IP_BLOCKED를 받아 다른 출발지로 바꿨다. 큐는 멈추지 않았고 시도 횟수도 쓰지 않았다. */
+  | { event: 'origin-rotated'; jobId: string; from: string; to: string; blockedUntil: string; detail: string }
+  /** 다른 출발지가 있지만 다른 워커의 속도 제한으로 큐가 멈춰 있어 바꾸지 않았다. 남은 정지만큼 멈춘다(뒤따르는 `rate-limited`). */
+  | { event: 'origin-rotation-held'; jobId: string; from: string; to: string; waitMs: number }
+  /** 출발지가 모두 막혔다. 가장 빨리 풀리는 시각까지 큐 전체를 멈춘다(뒤따르는 `rate-limited`). */
+  | { event: 'origins-exhausted'; jobId: string; waitMs: number; releases: { origin: string; blockedUntil: string | null }[] };
 
 export type ProcessorDeps = {
   /**
    * 수집 함수. 기본 조립은 `session.ts`의 `collect`에 undici 전송을 붙인 것(`index.ts`).
    * `options`는 이어받기(#19)다. 시작 페이지와, 페이지마다 결과·체크포인트를 쓰는 `onPage`를
    * 넘긴다. 무시하는 수집 함수(테스트의 가짜)는 처음부터 다 받아 돌려주면 된다.
+   *
+   * `origin`은 출발지 풀(`origins`)이 있을 때 이번 수집이 나갈 출발지다(#14). 수집 함수는 그 출발지의 전송으로
+   * **새 세션**을 만든다. 출발지를 바꾸면 이 함수를 다시 부르므로 로그인부터 다시 한다.
    */
-  collect: (data: CollectionJobData, options: CollectOptions) => Promise<CollectResult>;
+  collect: (data: CollectionJobData, options: CollectOptions, origin?: Origin) => Promise<CollectResult>;
   /** 결과 저장소와 차단기를 읽고 쓰는 연결. */
   redis: Redis;
   /** 원래 큐. 이름으로 결과 키를 만들고, `rateLimit`으로 큐 전체를 멈춘다. */
@@ -66,6 +79,12 @@ export type ProcessorDeps = {
    * 그 주기에 제한을 받은 작업을 DLQ에 NO_PROGRESS로 보낸다. 기본 `DEFAULT_NO_PROGRESS_CYCLES`.
    */
   noProgressCycles?: number;
+  /**
+   * 출발지 풀(#14). 없으면 출발지가 하나(수집 함수의 기본 전송)이고 IP_BLOCKED는 D2처럼 기다린다. 있으면
+   * IP_BLOCKED를 받은 출발지를 Retry-After가 끝날 때까지 빼고 다른 출발지로 바로 이어 받는다. 풀은 워커
+   * 프로세스마다 따로 든다(`origins.ts` 머리 주석).
+   */
+  origins?: OriginPool;
 };
 
 /**
@@ -230,15 +249,7 @@ export function createCollectionHandlers(deps: ProcessorDeps): CollectionHandler
     const data = job.data;
 
     // 차단기는 수집보다 먼저 본다. 여기를 지나면 로그인 요청이 나간다.
-    const blocked = await redis.get(authBlockKey(queue.name, data.loginId));
-    if (blocked !== null) {
-      log({ event: 'auth-blocked', jobId, loginId: data.loginId });
-      const kind = blockedKind(blocked);
-      const detail =
-        `차단기: ${data.loginId}는 이전 작업의 ${kind}로 막혀 있어 로그인하지 않았다(${blocked}). ` +
-        `자격증명을 고친 뒤 ${authBlockKey(queue.name, data.loginId)} 키를 지우고, 이 작업을 다시 돌리거나 지워야 한다`;
-      throw await recordDead(new UnrecoverableError(formatFailedReason(kind, detail)), job, jobId, kind, detail);
-    }
+    await checkAuthBlock(job, jobId);
 
     // 결과 저장소의 수명 규칙(#19 최종 리뷰 1·12). 1페이지부터 받는 실행은 같은 작업 ID의 옛 결과를
     // 먼저 지운다. 남겨 두면 작업을 지우고 다시 넣었을 때 옛 실행의 행이 건수와 결과에 섞인다. 이어받는
@@ -257,45 +268,106 @@ export function createCollectionHandlers(deps: ProcessorDeps): CollectionHandler
       if (data.checkpoint !== undefined) await job.updateData(requestOf(data));
     }
 
+    const origins = deps.origins;
+    // 처리를 시작할 때 이 프로세스가 아는 출발지가 모두 막혀 있으면 로그인을 보내지 않고 곧바로 가장 빨리 풀리는
+    // 출발지까지 큐를 멈춘다(final-review #6). 보내 봐야 확정적인 403이고, 차단 중인 출발지에 요청을 더한다.
+    // concurrency가 2 이상이거나 다른 워커의 짧은 정지가 앞선 정지를 덮어쓴 경우에 생긴다.
+    if (origins !== undefined && origins.available() === undefined) {
+      const now = clock();
+      const waitMs = Math.max(1, origins.earliestRelease() - now);
+      logExhausted(jobId, origins, waitMs, now);
+      const detail = `출발지 ${origins.size}개가 모두 막혀 있어 보내지 않았다`;
+      return dispose(job, jobId, { ok: false, kind: 'IP_BLOCKED', detail, retryAfterSec: waitMs / 1000 }, waitMs);
+    }
+    let origin = origins?.pick();
+    let rotations = 0;
+    let exhaustedWaitMs: number | undefined;
     let result: CollectResult;
-    try {
-      result = await deps.collect(job.data, {
-        startPage: checkpoint?.nextPage ?? 1,
-        ...(checkpoint?.maxPage === undefined ? {} : { maxPage: checkpoint.maxPage }),
-        onPage: async (rows, page, maxPage) => {
-          try {
-            // 진행은 **받자마자** 센다. 결과·체크포인트 쓰기(두 번 왕복) 뒤에 세면 그 사이 다른 워커가
-            // 받은 429가 먼저 주기를 세어, 이미 받은 페이지를 다음 주기로 넘긴다(#19 리뷰 1b). 쓰기 전에
-            // 죽어도 진행이 한 번 더 세어질 뿐이고, 그것은 상한을 늦출 뿐 행을 만들지 않는다.
-            await creditProgress();
-            // **행을 먼저, 체크포인트를 나중에 쓴다.** 둘 사이에 워커가 죽으면 다시 시작한 쪽이
-            // 같은 페이지를 한 번 더 받아 같은 seq에 덮어쓸 뿐이다. 반대 순서면 체크포인트만
-            // 넘어가고 그 페이지의 행이 영영 빠진다.
-            //
-            // 체크포인트 쓰기는 잠금을 확인하지 않고 앞으로만 가는지도 보지 않는다(#19 최종 리뷰 11). 잠금을
-            // 잃은 채 멈춰 있던 워커가 늦게 깨어나면 다른 워커가 앞으로 옮긴 체크포인트를 뒤로 덮을 수 있다.
-            // 결과는 seq 필드라 행은 잃지도 늘지도 않고, 다시 받는 요청과 진행 한 번이 더 세어질 뿐이다.
-            // 막으려면 BullMQ 잠금 토큰으로 쓰기를 거르는 스크립트가 필요해 두지 않았다.
-            await writeResults(jobId, rows);
-            const written = await redis.hlen(key);
-            const cap = maxPage ?? checkpoint?.maxPage;
-            await job.updateData({ ...job.data, checkpoint: { nextPage: page + 1, rows: written, ...(cap === undefined ? {} : { maxPage: cap }) } });
-          } catch (error) {
-            // 저장 중의 오류는 표 바깥의 일반 오류다(재시도). 아래 catch의 RangeError(설정 오류) 가지로
-            // 새지 않게 감싼다(#19 최종 리뷰 9: ioredis·JSON이 RangeError를 던지면 '설정 오류'로 한 번에 DLQ였다).
-            throw new PersistenceError(error instanceof Error ? error.message : String(error), { cause: error });
-          }
-        },
-      });
-    } catch (error) {
-      // `collect`가 던지는 것은 자격증명 없음·공유키 형식 오류·기간 형식 오류(RangeError)다.
-      // 수집 실패가 아니라 배치 설정이나 호출하는 쪽의 버그라서 일곱 종 어디에도 맞지 않고,
-      // 다시 해도 풀리지 않는다. 분류 없이(kind null) 한 번에 끝낸다.
-      if (error instanceof RangeError) {
-        const detail = `설정 오류: ${error.message}`;
-        throw await recordDead(new UnrecoverableError(detail), job, jobId, null, detail);
+    // 출발지 전환(#14). IP_BLOCKED를 받았는데 다른 출발지가 남아 있으면, 큐를 멈추지 않고 주기로도 세지 않고
+    // 시도 횟수도 쓰지 않고 **이 처리 안에서** 다른 출발지로 다시 수집한다. 다시 부르는 수집 함수는 새 세션을
+    // 만들므로 로그인부터 한다(대상 서버가 세션을 발급 출발지에 묶는다고 가정한다. 이 실험실의 대상 서버는
+    // 묶지 않는다, d3-origin.md 2절 H3). 받은 페이지는 `onPage`가 체크포인트에 남겼으므로 거기서 잇는다.
+    //
+    // 전환은 한 처리에서 출발지 수 - 1번까지다(출발지마다 한 번씩 써 본다). 막아 둔 출발지가 그사이 풀려 서로
+    // 번갈아 막히는 경우에도 처리가 큐를 멈추지 않은 채 끝없이 돌지 않게 한다. 넘으면 모두 막힌 것으로 보고 아래
+    // 처분(큐 정지)으로 간다.
+    for (;;) {
+      try {
+        result = await deps.collect(
+          job.data,
+          {
+            startPage: checkpoint?.nextPage ?? 1,
+            ...(checkpoint?.maxPage === undefined ? {} : { maxPage: checkpoint.maxPage }),
+            onPage: async (rows, page, maxPage) => {
+              try {
+                // 진행은 **받자마자** 센다. 결과·체크포인트 쓰기(두 번 왕복) 뒤에 세면 그 사이 다른 워커가
+                // 받은 429가 먼저 주기를 세어, 이미 받은 페이지를 다음 주기로 넘긴다(#19 리뷰 1b). 쓰기 전에
+                // 죽어도 진행이 한 번 더 세어질 뿐이고, 그것은 상한을 늦출 뿐 행을 만들지 않는다.
+                await creditProgress();
+                // **행을 먼저, 체크포인트를 나중에 쓴다.** 둘 사이에 워커가 죽으면 다시 시작한 쪽이
+                // 같은 페이지를 한 번 더 받아 같은 seq에 덮어쓸 뿐이다. 반대 순서면 체크포인트만
+                // 넘어가고 그 페이지의 행이 영영 빠진다.
+                //
+                // 체크포인트 쓰기는 잠금을 확인하지 않고 앞으로만 가는지도 보지 않는다(#19 최종 리뷰 11). 잠금을
+                // 잃은 채 멈춰 있던 워커가 늦게 깨어나면 다른 워커가 앞으로 옮긴 체크포인트를 뒤로 덮을 수 있다.
+                // 결과는 seq 필드라 행은 잃지도 늘지도 않고, 다시 받는 요청과 진행 한 번이 더 세어질 뿐이다.
+                // 막으려면 BullMQ 잠금 토큰으로 쓰기를 거르는 스크립트가 필요해 두지 않았다.
+                await writeResults(jobId, rows);
+                const written = await redis.hlen(key);
+                const cap = maxPage ?? checkpoint?.maxPage;
+                await job.updateData({ ...job.data, checkpoint: { nextPage: page + 1, rows: written, ...(cap === undefined ? {} : { maxPage: cap }) } });
+              } catch (error) {
+                // 저장 중의 오류는 표 바깥의 일반 오류다(재시도). 아래 catch의 RangeError(설정 오류) 가지로
+                // 새지 않게 감싼다(#19 최종 리뷰 9: ioredis·JSON이 RangeError를 던지면 '설정 오류'로 한 번에 DLQ였다).
+                throw new PersistenceError(error instanceof Error ? error.message : String(error), { cause: error });
+              }
+            },
+          },
+          origin,
+        );
+      } catch (error) {
+        // `collect`가 던지는 것은 자격증명 없음·공유키 형식 오류·기간 형식 오류(RangeError)다.
+        // 수집 실패가 아니라 배치 설정이나 호출하는 쪽의 버그라서 일곱 종 어디에도 맞지 않고,
+        // 다시 해도 풀리지 않는다. 분류 없이(kind null) 한 번에 끝낸다.
+        if (error instanceof RangeError) {
+          const detail = `설정 오류: ${error.message}`;
+          throw await recordDead(new UnrecoverableError(detail), job, jobId, null, detail);
+        }
+        throw error;
       }
-      throw error;
+
+      if (origins === undefined || origin === undefined) break;
+      const stats = origins.record(origin, result.ok);
+      log({ event: 'origin-result', jobId, origin: origin.name, outcome: result.ok ? 'ok' : result.kind, ...stats });
+      if (result.ok || result.kind !== 'IP_BLOCKED') break;
+
+      // 차단된 출발지는 대상 서버가 준 Retry-After가 끝날 때까지 뺀다. 고르는 기준은 이 해제 시각뿐이다.
+      const now = clock();
+      // 로그에는 풀이 실제로 든 해제 시각을 싣는다. 같은 출발지를 다른 작업이 더 길게 막아 두었으면 그쪽이다.
+      const blockedUntil = origins.block(origin, now + waitMsOf(result));
+      const next = rotations + 1 < origins.size ? origins.available() : undefined;
+      if (next !== undefined) {
+        // 다른 워커가 속도 제한으로 큐를 멈춰 두었으면 바꾸지 않는다. 처리 안의 전환은 BullMQ로 돌아가지 않으므로
+        // 그대로 두면 큐 정지 중에 새 출발지로 로그인·페이지가 나가, 속도 제한을 출발지 전환으로 비켜 가게 된다
+        // (final-review #5). 남은 정지만큼 큐 정지 경로로 보낸다. 같은 창 안이면 `COUNT_CYCLE`이 같은 주기로 친다.
+        const pausedMs = await queuePauseMs();
+        if (pausedMs > 0) {
+          exhaustedWaitMs = pausedMs;
+          log({ event: 'origin-rotation-held', jobId, from: origin.name, to: next.name, waitMs: pausedMs });
+          break;
+        }
+        await checkAuthBlock(job, jobId);
+        rotations += 1;
+        log({ event: 'origin-rotated', jobId, from: origin.name, to: next.name, blockedUntil: new Date(blockedUntil).toISOString(), detail: result.detail });
+        origin = next;
+        checkpoint = job.data.checkpoint;
+        continue;
+      }
+      // 모두 막혔다. 이 작업의 Retry-After가 아니라 가장 빨리 풀리는 출발지까지 큐 전체를 멈춘다. 그 뒤는 D2와 같은
+      // 길이다(주기 세기 `COUNT_CYCLE`, 진행 기반 상한). DLQ로는 NO_PROGRESS로만 간다.
+      exhaustedWaitMs = Math.max(1, origins.earliestRelease() - now);
+      logExhausted(jobId, origins, exhaustedWaitMs, now);
+      break;
     }
 
     if (result.ok) {
@@ -311,7 +383,42 @@ export function createCollectionHandlers(deps: ProcessorDeps): CollectionHandler
       log({ event: 'completed', jobId, attemptsMade: job.attemptsMade, rows: count });
       return { count };
     }
-    return dispose(job, jobId, result);
+    return dispose(job, jobId, result, exhaustedWaitMs);
+  }
+
+  /**
+   * 자격증명 차단기(`authBlockKey`)가 걸려 있으면 로그인하지 않고 DLQ로 끝낸다(던진다). 처리를 시작할 때, 그리고
+   * 출발지를 바꿔 다시 수집하기 직전마다 본다(#14). 전환은 로그인을 다시 보내므로, 앞 시도가 도는 동안 같은
+   * 로그인 ID의 다른 작업이 AUTH_FAILED로 차단기를 걸었으면 틀린 비밀번호가 한 번 더 나간다(final-review #3).
+   */
+  async function checkAuthBlock(job: Job<CollectionJobData>, jobId: string): Promise<void> {
+    const { loginId } = job.data;
+    const blocked = await redis.get(authBlockKey(queue.name, loginId));
+    if (blocked === null) return;
+    log({ event: 'auth-blocked', jobId, loginId });
+    const kind = blockedKind(blocked);
+    const detail =
+      `차단기: ${loginId}는 이전 작업의 ${kind}로 막혀 있어 로그인하지 않았다(${blocked}). ` +
+      `자격증명을 고친 뒤 ${authBlockKey(queue.name, loginId)} 키를 지우고, 이 작업을 다시 돌리거나 지워야 한다`;
+    throw await recordDead(new UnrecoverableError(formatFailedReason(kind, detail)), job, jobId, kind, detail);
+  }
+
+  /**
+   * 다른 워커가 속도 제한으로 건 큐 정지가 남은 시간(ms). 없으면 0. `queue.rateLimit`은 limiter 키를
+   * `Number.MAX_SAFE_INTEGER`로 두므로(bullmq 6.3.8 `setRateLimit`) 그 값으로 물으면 limiter가 평소에 세는 작업 수와
+   * 섞이지 않는다(`getRateLimitTtl` 스크립트는 키 값이 maxJobs 이상일 때만 PTTL을 준다).
+   */
+  async function queuePauseMs(): Promise<number> {
+    return Math.max(0, await queue.getRateLimitTtl(Number.MAX_SAFE_INTEGER));
+  }
+
+  function logExhausted(jobId: string, origins: OriginPool, waitMs: number, now: number): void {
+    log({
+      event: 'origins-exhausted',
+      jobId,
+      waitMs,
+      releases: origins.states().map((o) => ({ origin: o.name, blockedUntil: o.blockedUntil === null || o.blockedUntil <= now ? null : new Date(o.blockedUntil).toISOString() })),
+    });
   }
 
   /** 큐 전체의 진행을 하나 센다(`progressKey`의 `pages`, `COUNT_CYCLE`). */
@@ -338,7 +445,11 @@ export function createCollectionHandlers(deps: ProcessorDeps): CollectionHandler
     await redis.hset(resultsKey(queue.name, jobId), fields);
   }
 
-  async function dispose(job: Job<CollectionJobData>, jobId: string, failure: Failure): Promise<never> {
+  /**
+   * `waitOverrideMs`는 출발지가 모두 막혔을 때 가장 빨리 풀리는 출발지까지의 시간이다(#14). 없으면 이 실패의
+   * Retry-After다.
+   */
+  async function dispose(job: Job<CollectionJobData>, jobId: string, failure: Failure, waitOverrideMs?: number): Promise<never> {
     const { kind, detail } = failure;
 
     switch (DISPOSITION[kind]) {
@@ -348,11 +459,10 @@ export function createCollectionHandlers(deps: ProcessorDeps): CollectionHandler
         // 타입이 선택 필드라 없을 때는 분류기의 기본값(대상 서버 창 W)을 쓴다. 큐 정지는 이 값이 아니라
         // 같은 주기에서 가장 늦게 끝나는 Retry-After까지다(`COUNT_CYCLE`).
         //
-        // IP_BLOCKED가 여기로 오는 것은 D2의 임시 처분이다(`queue.ts` DISPOSITION 주석). 출발지가
-        // 하나라 전환할 곳이 없고, 대상 서버 차단은 Retry-After 뒤 스스로 풀린다. #14에서 출발지
-        // 전환(FIRST_REMEDY의 ROTATE_EGRESS)이 들어오면 이 칸이 바뀐다.
-        const waitSec = 'retryAfterSec' in failure && failure.retryAfterSec !== undefined ? failure.retryAfterSec : DEFAULT_RATE_LIMIT_WAIT_SEC;
-        const waitMs = Math.max(1, Math.round(waitSec * 1000));
+        // IP_BLOCKED가 여기로 오는 것은 전환할 출발지가 없을 때뿐이다(`queue.ts` DISPOSITION 주석). 출발지 풀이
+        // 없거나(출발지 하나), 풀의 출발지가 모두 막혔을 때다(`run`). 뒤의 경우 대기는 가장 빨리 풀리는 출발지까지다.
+        // 대상 서버 차단은 Retry-After 뒤 스스로 풀린다.
+        const waitMs = waitOverrideMs ?? waitMsOf(failure);
         log({ event: 'rate-limited', jobId, attemptsMade: job.attemptsMade, kind, waitMs, detail });
 
         // 진행 기반 상한(#19). 큐 전체의 연속 무진행 주기 수를 센다(`COUNT_CYCLE`, `progressKey`).
@@ -543,6 +653,15 @@ function blockedKind(value: string): FailureKind {
     // 사람이 손으로 넣은 값일 수 있다. 막는다는 뜻만 읽는다.
   }
   return 'AUTH_FAILED';
+}
+
+/**
+ * 실패의 대기 시간(ms). 서버가 준 Retry-After다. RATE_LIMITED·IP_BLOCKED에는 분류기가 항상 채우지만, 타입이
+ * 선택 필드라 없을 때는 분류기의 기본값(대상 서버 창 W)을 쓴다.
+ */
+function waitMsOf(failure: Failure): number {
+  const waitSec = 'retryAfterSec' in failure && failure.retryAfterSec !== undefined ? failure.retryAfterSec : DEFAULT_RATE_LIMIT_WAIT_SEC;
+  return Math.max(1, Math.round(waitSec * 1000));
 }
 
 /**

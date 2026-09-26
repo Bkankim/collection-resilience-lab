@@ -1,14 +1,44 @@
-# D1~D3에 걸쳐 채운다. 지금은 뼈대만 둔다.
+# 워크트리 디렉터리 이름과 상관없이 같은 프로젝트로 묶는다. 이름이 갈리면 같은 6379를 잡는 redis가 둘이 된다.
+name: collection-resilience-lab
+
 services:
   target:
     # 수집 대상 서버. 차단 스위치를 가진 쪽.
+    # 프록시와 같은 네트워크에 둔다. 호스트에서 띄우면 두 프록시가 같은 주소(VM 게이트웨이)로 보여
+    # 출발지가 갈리지 않는다(docs/evidence/d3-origin.md 2절 H1).
     build:
       context: .
       dockerfile: target/Dockerfile
     ports:
+      # 관리 API(/admin/*)를 호스트에서 쓴다. 호스트에서 이 포트로 바로 보낸 요청은 게이트웨이 주소 하나로 보인다.
       - "8080:8080"
     environment:
       PORT: 8080
+    networks:
+      origins:
+        ipv4_address: 172.28.14.10
+
+  # 출발지 두 개(#14). 워커는 WORKER_PROXIES=http://127.0.0.1:3128,http://127.0.0.1:3129 와
+  # TARGET_ORIGIN=http://target:8080 으로 띄운다(대상 서버 이름은 프록시가 푼다).
+  proxy-a:
+    build: docker/tinyproxy
+    volumes:
+      - ./docker/tinyproxy/tinyproxy.conf:/etc/tinyproxy/tinyproxy.conf:ro
+    ports:
+      - "127.0.0.1:3128:8888"
+    networks:
+      origins:
+        ipv4_address: 172.28.14.11
+
+  proxy-b:
+    build: docker/tinyproxy
+    volumes:
+      - ./docker/tinyproxy/tinyproxy.conf:/etc/tinyproxy/tinyproxy.conf:ro
+    ports:
+      - "127.0.0.1:3129:8888"
+    networks:
+      origins:
+        ipv4_address: 172.28.14.12
 
   redis:
     image: redis:7-alpine
@@ -20,3 +50,9 @@ services:
       interval: 5s
       timeout: 3s
       retries: 5
+
+networks:
+  origins:
+    ipam:
+      config:
+        - subnet: 172.28.14.0/24
