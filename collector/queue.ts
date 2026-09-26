@@ -293,8 +293,11 @@ export function parseFailedReason(reason: string | undefined): RecordedFailure {
  *
  * 종류별 근거:
  * - RATE_LIMITED: 큐 전체를 멈춘다(`FIRST_REMEDY` PAUSE_QUEUE).
- * - IP_BLOCKED: 대응은 출발지 전환인데 D2에는 출발지가 하나뿐이다. **D2의 임시 처분으로
- *   rate-limit을 쓴다.** 대상 서버 차단은 `blockDurationSec` 뒤 스스로 풀리고 Retry-After를
+ * - IP_BLOCKED: 대응은 출발지 전환이다(#14). **이 표에 오기 전에** 워커가 출발지 풀에서 다른 출발지를
+ *   골라 바로 다시 수집한다(`worker/process.ts` `run`, `client/origins.ts`). 그때는 큐를 멈추지 않고 주기로도
+ *   세지 않고 시도 횟수도 쓰지 않는다. 이 칸(rate-limit)은 **전환할 곳이 없을 때**의 처분이다. 출발지 풀이
+ *   없거나(`WORKER_PROXIES` 미설정, D2와 같다), 풀의 출발지가 모두 막혔을 때다. 뒤의 경우 큐 정지는 가장 빨리
+ *   풀리는 출발지까지다. 대상 서버 차단은 `blockDurationSec` 뒤 스스로 풀리고 Retry-After를
  *   준다(`target/switches.ts`). 처음에는 "같은 출발지로 기다려도 풀리지 않는다"며 fail-now로
  *   뒀는데 대상 서버와 사실이 달랐고, 일시 차단 2초 동안 대기 작업 5건이 전부 영구 failed가
  *   됐다(#13 리뷰 r3 재현). 실패 작업은 지우지 않고 작업 ID가 같으면 새로 만들지 않으므로,
@@ -302,7 +305,7 @@ export function parseFailedReason(reason: string | undefined): RecordedFailure {
  *   시도 횟수를 깎지 않는다는 `CONSUMES_ATTEMPT.IP_BLOCKED`(false)와도 맞는다. 다만 차단이
  *   풀리자마자 다시 막히면 속도 제한과 같은 끝나지 않는 반복이 됐다(TROUBLESHOOTING 4번). #19 뒤로는
  *   받은 페이지부터 이어받고, 큐 전체가 나아가지 못하면 진행 기반 상한이 NO_PROGRESS로 끊는다.
- *   #14에서 출발지 전환(ROTATE_EGRESS)이 들어오면 이 칸이 바뀐다.
+ *   출발지가 모두 막혀도 DLQ로는 이 상한으로만 간다.
  * - SESSION_EXPIRED: 정상 흐름에서는 밖으로 나오지 않는다. `collect` 안에서 재인증하고 그
  *   페이지를 한 번 다시 보내며, 재인증 직후 또 세션 실패면 UNKNOWN으로 올려 내보낸다
  *   (`session.ts` `#fetchPage`·`#login`). 다만 1차 인증(`/login`) 응답이 세션 실패로

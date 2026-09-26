@@ -26,11 +26,13 @@ import { buildApp } from '../../target/app.js';
 import { TRANSACTIONS_CONTENT_TYPE, buildLedger, encodeEucKr, renderTransactionsHtml, selectPage } from '../../target/transactions.js';
 import type { Failure } from '../client/classify.js';
 import { systemClock } from '../client/clock.js';
+import { OriginPool } from '../client/origins.js';
+import type { Origin } from '../client/origins.js';
 import type { Transaction } from '../client/parse.js';
 import { collect } from '../client/session.js';
 import type { CollectOptions, CollectResult } from '../client/session.js';
 import { createUndiciTransport } from '../client/transport.js';
-import type { Transport } from '../client/transport.js';
+import type { HttpRequest, Transport } from '../client/transport.js';
 import {
   COLLECT_JOB,
   COLLECT_JOB_OPTIONS,
@@ -119,8 +121,8 @@ async function makeLab() {
     /** 진입점과 같은 조립으로 워커를 띄운다. `limiter`도 진입점 기본값 그대로다. */
     async startWorker(
       workerName: string,
-      collectFn: (data: CollectionJobData, options: CollectOptions) => Promise<CollectResult>,
-      extra: Partial<Pick<ProcessorDeps, 'noProgressCycles' | 'redis'>> & Pick<CollectionWorkerOptions, 'stalled'> = {},
+      collectFn: ProcessorDeps['collect'],
+      extra: Partial<Pick<ProcessorDeps, 'noProgressCycles' | 'redis' | 'origins'>> & Pick<CollectionWorkerOptions, 'stalled'> = {},
     ) {
       const connection = createRedis('worker', url);
       connections.push(connection);
@@ -1209,5 +1211,229 @@ suite('큐 워커: 이어받기와 진행 기반 상한(#19)', () => {
     expect(starts).toEqual([1, 1, 2, 2, 2]);
     expect(await lab.deadLetter.count()).toBe(0);
     expect(((await lab.queue.getJob(id))?.returnvalue as ProcessorResult).count).toBe(1);
+  });
+});
+
+/**
+ * 출발지 전환(#14) 테스트용 출발지. 이 프로세스 안에서는 출발지가 모두 127.0.0.1이라 대상 서버의 출발지 차단으로는
+ * 한 출발지만 막을 수 없다. 그래서 출발지마다 대상 서버 앞에 문을 하나 두고, 규칙(`gate`)이 응답을 주면 대상 서버에
+ * 보내지 않고 그 응답(대상 서버와 같은 모양의 403·429)을 돌려준다. 규칙이 없으면 실제 대상 서버로 보낸다.
+ * 어느 출발지로 무엇이 나갔는지는 `hits`에 모은다. 대상 서버가 소켓 주소로 가르는 것은 compose 실측이 본다
+ * (`docs/evidence/d3-origin.md`).
+ */
+type OriginHit = { t: number; origin: string; path: string; page?: number; status: number };
+type Gate = (req: HttpRequest, n: number) => { status: 403 | 429; retryAfterSec: number } | undefined;
+
+function gatedOrigins(targetOrigin: string, gates: Record<string, Gate>) {
+  const inner = createUndiciTransport({ origin: targetOrigin });
+  const hits: OriginHit[] = [];
+  const origins: Origin[] = Object.entries(gates).map(([name, gate]) => {
+    let n = 0;
+    return {
+      name,
+      transport: async (req) => {
+        n += 1;
+        const path = req.path.split('?')[0] ?? req.path;
+        const page = /[?&]page=(\d+)/.exec(req.path)?.[1];
+        const hit = (status: number) => hits.push({ t: Date.now(), origin: name, path, status, ...(page === undefined ? {} : { page: Number(page) }) });
+        const closed = gate(req, n);
+        if (closed !== undefined) {
+          hit(closed.status);
+          const error = closed.status === 403 ? 'IP_BLOCKED' : 'RATE_LIMITED';
+          return {
+            status: closed.status,
+            headers: { 'retry-after': String(closed.retryAfterSec), 'content-type': 'application/json; charset=utf-8' },
+            body: Buffer.from(JSON.stringify({ error, origin: name, retryAfterSec: closed.retryAfterSec })),
+          };
+        }
+        const res = await inner(req);
+        hit('network' in res ? 0 : res.status);
+        return res;
+      },
+    };
+  });
+  return { origins, hits };
+}
+
+/** 실제 수집 함수. 출발지가 오면 그 출발지의 전송으로 새 세션을 만든다(`index.ts`와 같은 조립). */
+function originCollect(): ProcessorDeps['collect'] {
+  return (data, options, egress) => {
+    if (egress === undefined) throw new Error('출발지 풀이 있는 워커인데 출발지가 오지 않았다');
+    return collect({ transport: egress.transport, clock: systemClock }, data.loginId, data.accountNo, data.from, data.to, options);
+  };
+}
+
+function originTrace(hits: OriginHit[]): string[] {
+  return hits.map((h) => `${h.origin} ${h.path}${h.page === undefined ? '' : ` ${h.page}`}${h.status === 200 ? '' : ` (${h.status})`}`);
+}
+
+const pass: Gate = () => undefined;
+
+suite('큐 워커: 출발지 전환(#14)', () => {
+  const ALL = { from: '2026-01-01 00:00:00', to: '2026-12-31 23:59:59' };
+
+  it('IP_BLOCKED면 다른 출발지로 바로 바꿔 다시 로그인하고 받은 페이지부터 이어 받는다. 큐를 멈추지 않고 주기로 세지 않고 시도를 쓰지 않는다', { timeout: TIMEOUT }, async () => {
+    const target = await startTarget();
+    const lab = await makeLab();
+    // A는 3페이지에서 5초 차단. 큐를 멈췄다면 5초 안에 끝날 수 없다.
+    const { origins, hits } = gatedOrigins(target.origin, {
+      A: (req) => (req.path.includes('page=3') ? { status: 403, retryAfterSec: 5 } : undefined),
+      B: pass,
+    });
+    await lab.startWorker('w1', originCollect(), { origins: new OriginPool(origins, systemClock) });
+    const started = Date.now();
+    const id = await lab.add(DEMO01, ALL.from, ALL.to);
+    expect(await lab.waitFinished([id])).toEqual({ [id]: 'completed' });
+    expect(Date.now() - started).toBeLessThan(3_000);
+
+    expect(originTrace(hits)).toEqual([
+      'A /login',
+      'A /auth/otp',
+      'A /transactions 1',
+      'A /transactions 2',
+      'A /transactions 3 (403)',
+      // 새 세션: 로그인부터 다시 하고, 체크포인트(3페이지)부터 잇는다.
+      'B /login',
+      'B /auth/otp',
+      'B /transactions 3',
+      'B /transactions 4',
+      'B /transactions 5',
+      'B /transactions 6',
+      'B /transactions 7',
+      'B /transactions 8',
+    ]);
+    const rotated = lab.events.filter((e) => e.event === 'origin-rotated');
+    expect(rotated).toMatchObject([{ from: 'A', to: 'B', jobId: id }]);
+    expect(lab.events.filter((e) => e.event === 'rate-limited')).toEqual([]);
+    expect(lab.events.filter((e) => e.event === 'origin-result').map((e) => e.event === 'origin-result' && [e.origin, e.outcome, e.ok, e.failed])).toEqual([
+      ['A', 'IP_BLOCKED', 0, 1],
+      ['B', 'ok', 1, 0],
+    ]);
+    expect(lab.events.find((e) => e.event === 'completed')).toMatchObject({ attemptsMade: 0, rows: 137 });
+    // 주기를 세는 스크립트를 부르지 않았다(진행만 올랐다).
+    expect(await lab.redis.hget(progressKey(lab.queue.name), 'cycles')).toBeNull();
+    expect(await readResults(lab.redis, lab.queue.name, id)).toEqual(buildLedger(DEMO01.accountNo, DEMO01.count));
+  });
+
+  it('429(RATE_LIMITED)에서는 출발지를 바꾸지 않고 지금처럼 큐를 멈춘다', { timeout: TIMEOUT }, async () => {
+    const target = await startTarget();
+    const lab = await makeLab();
+    const { origins, hits } = gatedOrigins(target.origin, {
+      A: (req, n) => (n === 3 ? { status: 429, retryAfterSec: 1 } : undefined),
+      B: pass,
+    });
+    await lab.startWorker('w1', originCollect(), { origins: new OriginPool(origins, systemClock) });
+    const id = await lab.add(DEMO02, ALL.from, ALL.to);
+    expect(await lab.waitFinished([id])).toEqual({ [id]: 'completed' });
+
+    expect(hits.every((h) => h.origin === 'A')).toBe(true);
+    expect(lab.events.filter((e) => e.event === 'origin-rotated')).toEqual([]);
+    expect(lab.events.filter((e) => e.event === 'rate-limited')).toMatchObject([{ kind: 'RATE_LIMITED', attemptsMade: 0, waitMs: 1000 }]);
+    const limitedAt = hits.find((h) => h.status === 429)?.t as number;
+    const next = hits.find((h) => h.t > limitedAt);
+    expect((next?.t ?? 0) - limitedAt).toBeGreaterThanOrEqual(950);
+  });
+
+  it('막힌 출발지는 Retry-After 동안 다음 작업에서도 후보에서 빠지고, 풀리면 목록 순서대로 첫 출발지로 돌아온다', { timeout: TIMEOUT }, async () => {
+    const target = await startTarget();
+    const lab = await makeLab();
+    // A는 첫 요청 하나만 1초 차단을 준다. 뒤 요청은 통과시키므로, A로 나간 요청이 또 있다면 풀이 A를 고른 것이다.
+    const { origins, hits } = gatedOrigins(target.origin, {
+      A: (_req, n) => (n === 1 ? { status: 403, retryAfterSec: 1 } : undefined),
+      B: pass,
+    });
+    await lab.startWorker('w1', originCollect(), { origins: new OriginPool(origins, systemClock) });
+    const first = await lab.add(DEMO02, at(0), at(24));
+    await lab.waitFinished([first]);
+    const blockedAt = hits[0]?.t as number;
+    const second = await lab.add(DEMO02, at(0), at(48));
+    await lab.waitFinished([second]);
+    // 두 번째 작업이 A의 차단 안에서 시작했어야 이 테스트가 제외를 본다.
+    expect(hits.filter((h) => h.path === '/login').at(-1)?.t as number).toBeLessThan(blockedAt + 1_000);
+    await sleep(Math.max(0, blockedAt + 1_050 - Date.now()));
+    const third = await lab.add(DEMO02, at(0), at(72));
+    expect(await lab.waitFinished([third])).toEqual({ [third]: 'completed' });
+
+    const logins = hits.filter((h) => h.path === '/login').map((h) => `${h.origin}${h.status === 200 ? '' : ` (${h.status})`}`);
+    expect(logins).toEqual(['A (403)', 'B', 'B', 'A']);
+    expect(lab.events.filter((e) => e.event === 'rate-limited')).toEqual([]);
+  });
+
+  it('출발지가 모두 막히면 가장 빨리 풀리는 시각까지 큐 전체를 멈추고(주기 1), 풀린 출발지로 이어 간다', { timeout: TIMEOUT }, async () => {
+    const target = await startTarget();
+    const lab = await makeLab();
+    // A 1초, B 3초 차단. 마지막으로 받은 차단(B)의 Retry-After는 3초지만 가장 빠른 해제는 A라서 큐는 1초 멈추고,
+    // 풀린 뒤에는 목록 순서대로 A로 간다.
+    const { origins, hits } = gatedOrigins(target.origin, {
+      A: (_req, n) => (n === 1 ? { status: 403, retryAfterSec: 1 } : undefined),
+      B: (_req, n) => (n === 1 ? { status: 403, retryAfterSec: 3 } : undefined),
+    });
+    await lab.startWorker('w1', originCollect(), { origins: new OriginPool(origins, systemClock) });
+    const id = await lab.add(DEMO02, ALL.from, ALL.to);
+    expect(await lab.waitFinished([id])).toEqual({ [id]: 'completed' });
+
+    expect(originTrace(hits)).toEqual([
+      'A /login (403)',
+      'B /login (403)',
+      'A /login',
+      'A /auth/otp',
+      'A /transactions 1',
+      'A /transactions 2',
+    ]);
+    // 대기는 A의 해제 시각까지다. A를 막은 뒤 B를 막기까지 걸린 수 ms만큼 1초보다 짧고, B의 3초와는 멀다.
+    const exhausted = lab.events.filter((e) => e.event === 'origins-exhausted');
+    expect(exhausted).toHaveLength(1);
+    const waitMs = exhausted[0]?.event === 'origins-exhausted' ? exhausted[0].waitMs : 0;
+    expect(waitMs).toBeGreaterThan(900);
+    expect(waitMs).toBeLessThanOrEqual(1000);
+    expect(lab.events.filter((e) => e.event === 'rate-limited')).toMatchObject([{ kind: 'IP_BLOCKED', attemptsMade: 0, waitMs }]);
+    // 큐 정지: 두 번째 403 뒤 그 대기 동안 어느 출발지로도 요청이 없다.
+    const gap = (hits[2]?.t as number) - (hits[1]?.t as number);
+    expect(gap).toBeGreaterThanOrEqual(waitMs - 50);
+    expect(gap).toBeLessThan(2_500);
+    expect(await lab.redis.hget(progressKey(lab.queue.name), 'cycles')).toBe('1');
+    expect(await lab.deadLetter.count()).toBe(0);
+  });
+
+  it('출발지가 모두 막힌 채 아무도 나아가지 못하면 DLQ로는 진행 기반 상한(NO_PROGRESS)으로만 간다', { timeout: TIMEOUT }, async () => {
+    const lab = await makeLab();
+    const origins = ['A', 'B'].map((name) => ({ name, transport: (async () => ({ network: { message: 'unused' } })) as Transport }));
+    const used: string[] = [];
+    const blocked: CollectResult = { ok: false, kind: 'IP_BLOCKED', detail: 'HTTP 403 + Retry-After', retryAfterSec: 0.1 };
+    await lab.startWorker(
+      'w1',
+      async (_data, _options, egress) => {
+        used.push(egress?.name ?? '-');
+        return blocked;
+      },
+      { origins: new OriginPool(origins, systemClock) },
+    );
+    const id = await lab.add(DEMO01, ALL.from, ALL.to);
+    expect(await lab.waitFinished([id])).toEqual({ [id]: 'failed' });
+
+    // 첫 처리는 A → B(전환) → 모두 막힘 → 큐 정지(주기 하나). 뒤 처리에서 B가 아직 막혀 있으면 전환 없이 바로
+    // 모두 막힘이다(A와 B의 해제가 수 ms 차이라 어느 쪽인지는 시각에 달렸다). 어느 쪽이든 정지 한 번이 주기 하나이고,
+    // 세 번째 주기에서 NO_PROGRESS다.
+    expect(used.slice(0, 2)).toEqual(['A', 'B']);
+    expect(lab.events.filter((e) => e.event === 'origins-exhausted')).toHaveLength(3);
+    expect(lab.events.filter((e) => e.event === 'rate-limited').map((e) => e.attemptsMade)).toEqual([0, 0, 0]);
+    expect((await lab.deadLetter.getJob(id))?.data).toMatchObject({ kind: 'NO_PROGRESS', attemptsMade: 1 });
+  });
+
+  it('출발지 풀이 없으면 지금 동작 그대로다: 출발지를 넘기지 않고, IP_BLOCKED는 Retry-After만큼 큐를 멈춘다', { timeout: TIMEOUT }, async () => {
+    const lab = await makeLab();
+    const seen: (Origin | undefined)[] = [];
+    let calls = 0;
+    await lab.startWorker('w1', async (_data, _options, egress) => {
+      seen.push(egress);
+      calls += 1;
+      return calls === 1 ? { ok: false, kind: 'IP_BLOCKED', detail: 'HTTP 403 + Retry-After', retryAfterSec: 0.3 } : { ok: true, rows: [], pages: 1 };
+    });
+    const id = await lab.add(DEMO02, ALL.from, ALL.to);
+    expect(await lab.waitFinished([id])).toEqual({ [id]: 'completed' });
+
+    expect(seen).toEqual([undefined, undefined]);
+    expect(lab.events.filter((e) => e.event.startsWith('origin'))).toEqual([]);
+    expect(lab.events.filter((e) => e.event === 'rate-limited')).toMatchObject([{ kind: 'IP_BLOCKED', attemptsMade: 0, waitMs: 300 }]);
   });
 });

@@ -6,7 +6,11 @@
  * 처리했는지와, 속도 제한 동안 두 워커가 모두 멈췄는지를 로그만으로 볼 수 있다.
  *
  * 환경변수:
- * - `TARGET_ORIGIN`: 대상 서버. 기본 `http://127.0.0.1:8080`.
+ * - `TARGET_ORIGIN`: 대상 서버. 기본 `http://127.0.0.1:8080`. 프록시를 쓰면 **프록시가 보는** 주소다
+ *   (compose면 `http://target:8080`).
+ * - `WORKER_PROXIES`: 출발지 프록시 목록(#14). 쉼표로 나눈 주소, 예 `http://127.0.0.1:3128,http://127.0.0.1:3129`.
+ *   목록 순서가 고르는 순서다. 비우면 프록시 없이 직접 보낸다(출발지 하나, IP_BLOCKED는 기다린다). 규칙은
+ *   `client/origins.ts` 머리 주석.
  * - `REDIS_URL`: 기본 `redis://127.0.0.1:6379`.
  * - `QUEUE_NAME`: 기본 `collections`(API와 같은 큐).
  * - `WORKER_NAME`: 로그에 찍을 이름. 기본 `worker-<pid>`.
@@ -21,6 +25,7 @@
 import { Queue } from 'bullmq';
 
 import { systemClock } from '../client/clock.js';
+import { OriginPool, createProxyOrigins, parseProxyList } from '../client/origins.js';
 import { collect } from '../client/session.js';
 import { createUndiciTransport } from '../client/transport.js';
 import { COLLECTION_QUEUE, createRedis, deadLetterQueueName } from '../queue.js';
@@ -37,6 +42,7 @@ const limiter = {
   duration: positiveInt('WORKER_LIMIT_DURATION_MS', DEFAULT_WORKER_LIMITER.duration),
 };
 const noProgressCycles = positiveInt('WORKER_NO_PROGRESS_CYCLES', DEFAULT_NO_PROGRESS_CYCLES);
+const proxies = parseProxyList(process.env.WORKER_PROXIES);
 
 function print(record: Record<string, unknown>): void {
   console.log(JSON.stringify({ t: new Date().toISOString(), worker: name, pid: process.pid, ...record }));
@@ -49,19 +55,25 @@ const workerConnection = createRedis('worker');
 const queue = new Queue<CollectionJobData>(queueName, { connection: redis });
 const deadLetter = new Queue<DeadLetterData>(deadLetterQueueName(queueName), { connection: redis });
 const transport = createUndiciTransport({ origin });
+// 출발지 풀은 이 프로세스만 든다. 다른 워커 프로세스와 차단 상태를 나누지 않는다(`origins.ts`).
+const proxyOrigins = proxies.length === 0 ? undefined : createProxyOrigins(proxies, origin);
+const origins = proxyOrigins === undefined ? undefined : new OriginPool(proxyOrigins.origins, systemClock);
 
 const worker = createCollectionWorker({
   connection: workerConnection,
   concurrency,
   limiter,
   deps: {
-    collect: (data, options) => collect({ transport, clock: systemClock }, data.loginId, data.accountNo, data.from, data.to, options),
+    // 출발지가 오면 그 출발지의 전송으로 새 세션을 만든다(`collect`는 부를 때마다 새 세션이다).
+    collect: (data, options, egress) =>
+      collect({ transport: egress?.transport ?? transport, clock: systemClock }, data.loginId, data.accountNo, data.from, data.to, options),
     redis,
     queue,
     deadLetter,
     clock: systemClock,
     log: (event: WorkerEvent) => print(event),
     noProgressCycles,
+    ...(origins === undefined ? {} : { origins }),
   },
 });
 
@@ -84,6 +96,7 @@ for (const signal of ['SIGINT', 'SIGTERM'] as const) {
       await worker.close();
       await queue.close();
       await deadLetter.close();
+      await proxyOrigins?.close();
       workerConnection.disconnect();
       await redis.quit();
       print({ event: 'closed' });
@@ -93,7 +106,7 @@ for (const signal of ['SIGINT', 'SIGTERM'] as const) {
 }
 
 await worker.waitUntilReady();
-print({ event: 'ready', queue: queueName, origin, concurrency, limiter, noProgressCycles });
+print({ event: 'ready', queue: queueName, origin, proxies, concurrency, limiter, noProgressCycles });
 
 function nonBlank(value: string | undefined): string | undefined {
   return value === undefined || value.trim() === '' ? undefined : value;
