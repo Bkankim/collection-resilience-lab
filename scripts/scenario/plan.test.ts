@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { childEnv, periodEnd, runVerdict } from './plan.js';
+import { childEnv, periodEnd, retryUntil, runVerdict } from './plan.js';
 
 describe('작업 기간 끝', () => {
   it('초·분·시가 모두 올바른 범위다', () => {
@@ -40,5 +40,44 @@ describe('워커 자식 환경', () => {
       { REDIS_URL: 'redis://r/15', WORKER_NAME: 'w1' },
     );
     expect(env).toEqual({ PATH: '/bin', REDIS_URL: 'redis://r/15', WORKER_NAME: 'w1' });
+  });
+});
+
+describe('사전 점검 재시도', () => {
+  // 가짜 시계: sleep이 시계를 앞으로 민다. 실제로 기다리지 않는다.
+  const fakeClock = () => {
+    let t = 0;
+    return { now: () => t, sleep: async (ms: number) => void (t += ms), elapsed: () => t };
+  };
+
+  it('처음에 성공하면 기다리지 않고 값을 돌려준다', async () => {
+    const clock = fakeClock();
+    await expect(retryUntil(async () => 'ok', { what: 'x', timeoutMs: 30_000, intervalMs: 500, ...clock })).resolves.toBe('ok');
+    expect(clock.elapsed()).toBe(0);
+  });
+
+  it('compose가 막 떠서 연결이 실패하다가 살아나면 그 값을 돌려준다', async () => {
+    const clock = fakeClock();
+    let calls = 0;
+    const attempt = async () => {
+      calls += 1;
+      if (calls < 4) throw new Error('연결 실패');
+      return 200;
+    };
+    await expect(retryUntil(attempt, { what: 'x', timeoutMs: 30_000, intervalMs: 500, ...clock })).resolves.toBe(200);
+    expect(calls).toBe(4);
+    expect(clock.elapsed()).toBe(1500);
+  });
+
+  it('제한 시간 안에 끝내 실패하면 마지막 오류를 담아 무엇을 기다렸는지 적고 던진다', async () => {
+    const clock = fakeClock();
+    let calls = 0;
+    const attempt = async () => {
+      calls += 1;
+      throw new Error(`연결 실패 ${calls}`);
+    };
+    const done = retryUntil(attempt, { what: '대상 서버 /health', timeoutMs: 30_000, intervalMs: 500, ...clock });
+    await expect(done).rejects.toThrow(/대상 서버 \/health.*30000ms.*연결 실패 61/);
+    expect(clock.elapsed()).toBeLessThanOrEqual(30_000);
   });
 });

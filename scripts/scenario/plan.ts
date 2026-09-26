@@ -44,3 +44,29 @@ export function childEnv(parent: Record<string, string | undefined>, explicit: R
   }
   return { ...env, ...explicit };
 }
+
+/**
+ * 사전 점검 재시도. `docker compose up -d`는 컨테이너가 뜨면 바로 돌아오고, 대상 서버는 그 뒤에 tsx로 컴파일해
+ * listen한다(1~2초). README 세 줄을 한 번에 붙여 넣으면 첫 점검이 그 틈에 걸려 측정이 시작도 못 한다
+ * (#16 final-review). 실패하면 `intervalMs`마다 다시 해 보고, `timeoutMs`가 지나도 안 되면 마지막 오류를 담아 던진다.
+ * `now`·`sleep`은 테스트가 시계를 주입하는 자리다.
+ */
+export async function retryUntil<T>(
+  attempt: () => Promise<T>,
+  options: { what: string; timeoutMs: number; intervalMs: number; now?: () => number; sleep?: (ms: number) => Promise<void> },
+): Promise<T> {
+  const now = options.now ?? Date.now;
+  const sleep = options.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  const deadline = now() + options.timeoutMs;
+  for (;;) {
+    try {
+      return await attempt();
+    } catch (error) {
+      if (now() + options.intervalMs > deadline) {
+        const detail = error instanceof Error ? error.message : String(error);
+        throw new Error(`${options.what}: ${options.timeoutMs}ms 동안 다시 시도했지만 실패했다(마지막 오류: ${detail})`, { cause: error });
+      }
+      await sleep(options.intervalMs);
+    }
+  }
+}

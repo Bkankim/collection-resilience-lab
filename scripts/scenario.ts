@@ -41,7 +41,7 @@ import { buildLedger } from '../target/transactions.js';
 import type { SwitchState, Thresholds } from '../target/switches.js';
 import { RECOVERY_STREAK, failureWindow, formatRecovery, markdownTable, recoveryOf, secondsForStreak, throughputOf } from './scenario/metrics.js';
 import type { Recovery, Terminal } from './scenario/metrics.js';
-import { childEnv, periodEnd, runVerdict } from './scenario/plan.js';
+import { childEnv, periodEnd, retryUntil, runVerdict } from './scenario/plan.js';
 import { startRelay } from './scenario/relay.js';
 import type { Relay, RelayRecord } from './scenario/relay.js';
 
@@ -76,6 +76,8 @@ const OUT = process.env.SCENARIO_OUT?.trim() || join(ROOT, 'docs', 'results', TO
 const SCENARIO_TIMEOUT_MS = 8 * 60_000;
 /** 관리 API·수집 요청 API·사전 점검 요청 하나의 제한 시간. 넘기면 어디서 멈췄는지 적어 던진다. */
 const HTTP_TIMEOUT_MS = 10_000;
+/** 사전 점검(대상 서버, 프록시 경유)을 다시 해 보는 한도. compose가 막 떠서 아직 listen하지 않는 틈을 넘긴다. */
+const PREFLIGHT_RETRY = { timeoutMs: 30_000, intervalMs: 500 };
 
 type Scenario = { key: string; name: string; switches: SwitchState; thresholds: Thresholds; why: string };
 
@@ -155,7 +157,7 @@ async function main(): Promise<void> {
 
   const redis = new Redis(REDIS_URL, { maxRetriesPerRequest: 3 });
   await redis.ping();
-  await getJson(`${TARGET_ADMIN}/health`);
+  await retryUntil(() => getJson(`${TARGET_ADMIN}/health`), { what: '대상 서버 /health 사전 점검', ...PREFLIGHT_RETRY });
 
   let current = 'preflight';
   const relays: Relay[] = [];
@@ -172,8 +174,14 @@ async function main(): Promise<void> {
   const relayName = new Map(relays.map((r, i) => [r.url, UPSTREAMS[i]!.origin]));
   // 중계를 거쳐 대상 서버 /health가 오는지(차단 판정을 지나가는 경로다) 먼저 본다.
   for (const [i, relay] of relays.entries()) {
-    const status = await getViaProxy(relay.url, `${TARGET_ORIGIN}/health`);
-    if (status !== 200) throw new Error(`출발지 ${UPSTREAMS[i]!.origin}(${UPSTREAMS[i]!.upstream})로 대상 서버에 닿지 않는다: ${status}`);
+    const via = `출발지 ${UPSTREAMS[i]!.origin}(${UPSTREAMS[i]!.upstream})`;
+    await retryUntil(
+      async () => {
+        const status = await getViaProxy(relay.url, `${TARGET_ORIGIN}/health`);
+        if (status !== 200) throw new Error(`${via}로 대상 서버에 닿지 않는다: ${status}`);
+      },
+      { what: `${via} 사전 점검`, ...PREFLIGHT_RETRY },
+    );
   }
 
   const apiBase = `http://127.0.0.1:${API_PORT}`;

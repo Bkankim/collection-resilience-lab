@@ -22,8 +22,6 @@ services:
   # TARGET_ORIGIN=http://target:8080 으로 띄운다(대상 서버 이름은 프록시가 푼다).
   proxy-a:
     build: docker/tinyproxy
-    volumes:
-      - ./docker/tinyproxy/tinyproxy.conf:/etc/tinyproxy/tinyproxy.conf:ro
     ports:
       - "127.0.0.1:3128:8888"
     networks:
@@ -32,8 +30,6 @@ services:
 
   proxy-b:
     build: docker/tinyproxy
-    volumes:
-      - ./docker/tinyproxy/tinyproxy.conf:/etc/tinyproxy/tinyproxy.conf:ro
     ports:
       - "127.0.0.1:3129:8888"
     networks:
