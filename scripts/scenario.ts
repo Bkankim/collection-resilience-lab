@@ -39,8 +39,9 @@ import { COLLECTION_QUEUE, deadLetterQueueName, resultsKey } from '../collector/
 import type { DeadLetterData } from '../collector/queue.js';
 import { buildLedger } from '../target/transactions.js';
 import type { SwitchState, Thresholds } from '../target/switches.js';
-import { RECOVERY_STREAK, formatRecovery, markdownTable, recoveryOf, throughputOf } from './scenario/metrics.js';
+import { RECOVERY_STREAK, failureWindow, formatRecovery, markdownTable, recoveryOf, secondsForStreak, throughputOf } from './scenario/metrics.js';
 import type { Recovery, Terminal } from './scenario/metrics.js';
+import { childEnv, periodEnd, runVerdict } from './scenario/plan.js';
 import { startRelay } from './scenario/relay.js';
 import type { Relay, RelayRecord } from './scenario/relay.js';
 
@@ -73,6 +74,8 @@ const REDIS_URL = process.env.SCENARIO_REDIS_URL?.trim() || 'redis://127.0.0.1:6
 const TODAY = new Date().toLocaleDateString('sv-SE');
 const OUT = process.env.SCENARIO_OUT?.trim() || join(ROOT, 'docs', 'results', TODAY);
 const SCENARIO_TIMEOUT_MS = 8 * 60_000;
+/** 관리 API·수집 요청 API·사전 점검 요청 하나의 제한 시간. 넘기면 어디서 멈췄는지 적어 던진다. */
+const HTTP_TIMEOUT_MS = 10_000;
 
 type Scenario = { key: string; name: string; switches: SwitchState; thresholds: Thresholds; why: string };
 
@@ -123,6 +126,10 @@ type ScenarioResult = {
   dlqKinds: Record<string, number>;
   resultsMatch: { matched: number; total: number };
   recovery: Recovery;
+  /** 첫 실패 응답부터 마지막 실패 응답까지(ms). 실패 응답이 없으면 null. */
+  failureSpanMs: number | null;
+  /** 회복 시간의 기준점이 된 첫 실패 응답(상태와 경로). */
+  firstFailure: string | null;
   throughput: number;
   failureStatus: Record<string, number>;
   sessionExpired: number;
@@ -165,25 +172,44 @@ async function main(): Promise<void> {
     if (status !== 200) throw new Error(`출발지 ${UPSTREAMS[i]!.origin}(${UPSTREAMS[i]!.upstream})로 대상 서버에 닿지 않는다: ${status}`);
   }
 
-  const api = spawnLogged('api', [TSX, 'collector/api/server.ts'], { PORT: String(API_PORT), HOST: '127.0.0.1', REDIS_URL }, () => {});
   const apiBase = `http://127.0.0.1:${API_PORT}`;
-  await waitFor(async () => (await getJson(`${apiBase}/health`).catch(() => undefined)) !== undefined, 20_000, 'API /health');
-
   const results: ScenarioResult[] = [];
+  let aborted: unknown;
   try {
+    spawnLogged('api', [TSX, 'collector/api/server.ts'], { PORT: String(API_PORT), HOST: '127.0.0.1', REDIS_URL }, () => {});
+    await waitFor(async () => (await getJson(`${apiBase}/health`).catch(() => undefined)) !== undefined, 20_000, 'API /health');
     for (const scenario of scenarios) {
       current = scenario.key;
       results.push(await runScenario(scenario, redis, relays, apiBase));
     }
+  } catch (error) {
+    // 뒤 시나리오가 던져도 앞 시나리오까지 모은 원시 사건은 남긴다. 결과표는 쓰지 않는다(다 돌지 않은 표를 결과로 오해하지 않게).
+    aborted = error;
+    events.push({ scenario: current, src: 'runner', t: new Date().toISOString(), event: 'aborted', detail: error instanceof Error ? error.message : String(error) });
   } finally {
-    await stop(api.child);
+    await Promise.all([...children].map((child) => stop(child)));
     await Promise.all(relays.map((r) => r.close()));
     await redis.quit();
   }
+  const left = await survivors([...children]);
+  if (left.length > 0) {
+    killGroups(left);
+    aborted ??= new Error(`끈 뒤에도 남은 프로세스 그룹: ${left.join(', ')}`);
+  }
 
-  const report = render(results);
+  const verdict = runVerdict({ aborted: aborted !== undefined, timedOut: results.filter((r) => r.timedOut).map((r) => r.scenario.key) });
   await mkdir(OUT, { recursive: true });
-  await writeFile(join(OUT, 'events.jsonl'), events.map((e) => scrub(JSON.stringify(e, (_key, value) => (typeof value === 'string' ? (relayName.get(value) ?? value) : value)))).join('\n') + '\n');
+  const [eventsFile] = verdict.files;
+  await writeFile(join(OUT, eventsFile!), events.map((e) => scrub(JSON.stringify(e, (_key, value) => (typeof value === 'string' ? (relayName.get(value) ?? value) : value)))).join('\n') + '\n');
+  if (!verdict.complete) {
+    // 다 돌지 않은 측정은 결과표를 쓰지 않는다. 표는 진단용으로 stderr에만 낸다.
+    if (results.length > 0) process.stderr.write(render(results));
+    say(`결과로 쓰지 않는다(${verdict.reasons.join(', ')}): ${relative(ROOT, OUT)}/${eventsFile}만 남겼다`);
+    if (aborted !== undefined) throw aborted;
+    process.exitCode = verdict.exitCode;
+    return;
+  }
+  const report = render(results);
   await writeFile(join(OUT, 'results.md'), scrub(report));
   process.stdout.write(report);
   say(`원시 출력: ${relative(ROOT, OUT)}/events.jsonl, results.md`);
@@ -238,6 +264,9 @@ async function runScenario(
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ loginId: LOGIN_ID, accountNo: ACCOUNT_NO, from: '2026-01-01 00:00:00', to: periodEnd(i) }),
+      signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
+    }).catch((error: unknown) => {
+      throw new Error(`작업 투입 ${i}: ${HTTP_TIMEOUT_MS}ms 안에 응답이 없거나 연결 실패(${error instanceof Error ? error.message : String(error)})`);
     });
     const body = (await res.json()) as { id?: string; status?: string };
     if (res.status !== 202 || body.id === undefined) throw new Error(`작업 투입 실패 ${i}: ${res.status} ${JSON.stringify(body)}`);
@@ -255,6 +284,9 @@ async function runScenario(
     const dlq = await dead.count();
     counts = { completed: c.completed ?? 0, failed: c.failed ?? 0, dlq };
     if (counts.completed + counts.failed >= JOBS && counts.dlq >= counts.failed) break;
+    // 워커가 도중에 끝나면 워커 2개라는 조건이 깨진다. 남은 워커로 끝까지 재지 않고 중단한다.
+    const exited = workers.find((w) => w.child.exitCode !== null || w.child.signalCode !== null);
+    if (exited !== undefined) throw new Error(`${scenario.key}: 워커가 도중에 끝났다(${exited.child.exitCode ?? exited.child.signalCode})`);
     if (Date.now() > deadline) {
       timedOut = true;
       break;
@@ -268,6 +300,12 @@ async function runScenario(
   // 마지막 사건 줄이 파이프를 지나올 여유를 두고 끈다.
   await sleep(500);
   await Promise.all(workers.map((w) => stop(w.child)));
+  // 남은 워커가 있으면 다음 시나리오의 창과 키를 건드린다. 여기서 멈춘다.
+  const left = await survivors(workers.map((w) => w.child));
+  if (left.length > 0) {
+    killGroups(left);
+    throw new Error(`${scenario.key}: 워커를 끈 뒤에도 남은 프로세스 그룹: ${left.join(', ')}`);
+  }
 
   const mine = events.filter((e) => e.scenario === scenario.key);
   const workerEvents = mine.filter((e) => e.src === 'worker');
@@ -277,6 +315,8 @@ async function runScenario(
     .map((e) => ({ at: Date.parse(String(e.t)), jobId: String(e.jobId), ok: e.event === 'completed' }));
   const endedAt = terminals.length === 0 ? Date.now() : Math.max(...terminals.map((t) => t.at));
   const failures = relayEvents.filter((r) => r.status < 200 || r.status >= 300);
+  const window = failureWindow(failures.map((f) => Date.parse(f.t)));
+  const first = failures.find((f) => window !== null && Date.parse(f.t) === window.first);
   const failureStatus: Record<string, number> = {};
   for (const f of failures) failureStatus[f.status] = (failureStatus[f.status] ?? 0) + 1;
 
@@ -307,6 +347,8 @@ async function runScenario(
     dlqKinds,
     resultsMatch: { matched, total: completedJobs.length },
     recovery: recoveryOf(failures.map((f) => Date.parse(f.t)), terminals),
+    failureSpanMs: window?.ms ?? null,
+    firstFailure: first === undefined ? null : `${first.status} ${first.path}`,
     throughput: throughputOf(counts.completed, startedAt, endedAt),
     failureStatus,
     sessionExpired: relayEvents.filter((r) => r.sessionExpired).length,
@@ -325,12 +367,6 @@ async function runScenario(
 function summaryOf(r: ScenarioResult): Record<string, unknown> {
   const { scenario, ...rest } = r;
   return { name: scenario.name, ...rest };
-}
-
-/** 작업마다 다른 기간 끝(초 단위). 기간 시작은 같아 원장 137행 전부가 들어간다. 작업 ID는 기간으로 갈린다. */
-function periodEnd(i: number): string {
-  const pad = (n: number) => String(n).padStart(2, '0');
-  return `2026-09-01 00:${pad(Math.floor(i / 60))}:${pad(i % 60)}`;
 }
 
 async function clearKeys(redis: Redis): Promise<void> {
@@ -373,14 +409,16 @@ function render(results: ScenarioResult[]): string {
   const th = (t: Thresholds) => `${t.windowSec} / ${t.maxRequests} / ${t.blockAfter} / ${t.blockDurationSec} / ${t.sessionTtlSec}`;
   const kinds = (k: Record<string, number>) => (Object.keys(k).length === 0 ? '-' : Object.entries(k).map(([kind, n]) => `${kind} ${n}`).join(', '));
   const main = markdownTable(
-    ['시나리오', '켠 스위치', 'W / N / M / T / S', 'n', '성공률', `회복 시간`, '처리량(건/초)', '소요(초)'],
+    ['시나리오', '켠 스위치', 'W / N / M / T / S', 'n', '성공률', '회복 시간', `${RECOVERY_STREAK}/처리량(초)`, '실패 응답 구간(초)', '처리량(건/초)', '소요(초)'],
     results.map((r) => [
       r.scenario.name + (r.timedOut ? ' (시간 초과)' : ''),
       sw(r.scenario.switches),
       th(r.scenario.thresholds),
       '1',
       `${((r.completed / JOBS) * 100).toFixed(1)}% (${r.completed}/${JOBS})`,
-      formatRecovery(r.recovery),
+      formatRecovery(r.recovery) + (r.firstFailure === null ? '' : ` (기준 ${r.firstFailure})`),
+      secondsForStreak(r.throughput)?.toFixed(2) ?? '-',
+      r.failureSpanMs === null ? '-' : (r.failureSpanMs / 1000).toFixed(1),
       r.throughput.toFixed(2),
       ((r.endedAt - r.startedAt) / 1000).toFixed(1),
     ]),
@@ -432,45 +470,104 @@ ${why}
 - **성공률** = 완료(completed) 작업 수 / 투입 작업 수(${JOBS}).
 - **회복 시간** = 첫 실패 응답 시각부터, 그 뒤 끝난 순서로 작업 ${RECOVERY_STREAK}건이 연달아 완료된 시각까지. 첫 실패 응답은 중계가 본 첫
   비 2xx 응답(429, 403, 401)이다. 작업이 실패로 끝난 것을 세지 않는 이유: 이 설계는 속도 제한·차단에서 작업을 버리지 않아
-  작업 단위 실패가 거의 없다. 연속을 끊는 것은 DLQ로 간 작업이다. 실패 응답이 없으면 "해당 없음".
+  작업 단위 실패가 거의 없다. 연속을 끊는 것은 DLQ로 간 작업이다. 실패 응답이 없으면 "해당 없음". 괄호 안은 기준이 된 첫 실패 응답(상태, 경로).
+- **회복 시간의 한계**: 작업이 실패로 끝나지 않으므로 회복 시간은 사실상 "첫 실패 응답 뒤 작업 ${RECOVERY_STREAK}건이 끝나는 데 걸린 시간"이다.
+  그래서 처리량으로 계산한 ${RECOVERY_STREAK}/처리량과 거의 같고, 실패가 멈춘 시점을 재지 않는다. 실패가 언제까지 이어졌는지는
+  "실패 응답 구간"(첫 실패 응답부터 마지막 실패 응답까지)이 보인다.
 - **처리량** = 완료 작업 수 / 소요 시간. 소요 시간은 첫 작업을 넣기 직전부터 마지막 작업이 끝난 사건(\`completed\`·\`dead-letter\`)까지.
 - 실패 응답(상태별)·세션 만료 응답·로그인 요청은 중계가 본 응답 수다. 502는 중계가 upstream에 닿지 못해 만든 응답이고 \`events.jsonl\`에 \`relayError\`가 붙는다. 세션 만료 응답은 401 + \`X-Session-Expired\`.
 - 출발지 전환 = 워커 \`origin-rotated\` 수, 모두 막힘 = \`origins-exhausted\` 수, 큐 정지 = \`rate-limited\` 수(워커가 큐 전체를 멈춘 횟수. 두 워커가 같은 순간 각각 멈추면 2).
 - 결과 = 원장: 완료 작업마다 결과 해시 행 수(HLEN)가 대상 서버 원장의 그 기간 행 수와 같은 작업 수 / 완료 작업 수.
 - 대상 서버가 본 출발지: 그 구간 대상 서버 로그의 수집 요청 \`remoteAddress\`별 수(관리 API·health 제외). 로그 시각은 VM 시계(호스트보다 0.1~0.2초 앞섬)라 앞뒤 0.5초를 더 본다.
 - M(blockAfter)에는 기간이 없다. 차단 해제나 설정 변경 전까지 429가 누적된다(\`target/switches.ts\`).
+
+## 한계
+
+- 실패한 작업에 DLQ 항목이 생기지 않으면(DLQ 쓰기가 Redis 오류로 실패) 그 시나리오는 끝났다고 보지 않고 8분 시간 초과까지 기다린다.
+  시간 초과는 실행 실패로 끝나고 이 결과표를 쓰지 않으므로 잘못된 결과가 남지는 않는다.
 `;
 }
 
 type Spawned = { child: ChildProcess };
 
+/** 띄운 프로세스 전부. 시나리오 중간에 던져도 `main`의 finally가 남은 워커를 끈다(`stop`은 이미 끝난 프로세스를 건너뛴다). */
+const children = new Set<ChildProcess>();
+
+/**
+ * 자식은 제 프로세스 그룹으로 띄운다(`detached`). tsx는 실제 node를 자식으로 하나 더 띄우므로, 강제 종료(SIGKILL)를
+ * tsx에만 보내면 그 자식이 고아로 남아 다음 시나리오 동안 요청을 보낼 수 있다. 그룹에 보내면 둘 다 끝난다.
+ * 그 대신 터미널의 Ctrl-C가 자식에게 가지 않으므로 러너가 신호를 받아 자식을 끈다(아래 신호 처리).
+ */
 function spawnLogged(name: string, argv: string[], env: Record<string, string>, onLine: (line: string) => void): Spawned {
-  // 물려받은 워커 설정이 측정 조건을 조용히 바꾸지 않게 뺀다(기본값으로 잰다).
-  const base = { ...process.env };
-  for (const key of ['WORKER_CONCURRENCY', 'WORKER_LIMIT_MAX', 'WORKER_LIMIT_DURATION_MS', 'WORKER_NO_PROGRESS_CYCLES', 'QUEUE_NAME', 'WORKER_PROXIES']) delete base[key];
-  const child = spawn(argv[0]!, argv.slice(1), { cwd: ROOT, env: { ...base, ...env }, stdio: ['ignore', 'pipe', 'pipe'] });
+  const child = spawn(argv[0]!, argv.slice(1), { cwd: ROOT, env: childEnv(process.env, env), stdio: ['ignore', 'pipe', 'pipe'], detached: true });
+  children.add(child);
   createInterface({ input: child.stdout! }).on('line', onLine);
   createInterface({ input: child.stderr! }).on('line', (line) => say(`${name} stderr: ${line}`));
   return { child };
 }
 
+/**
+ * SIGTERM은 tsx에만 보낸다(tsx가 자식에게 넘긴다). 그룹 전체에 보내면 워커 node가 두 번 받는데, 워커는 첫 신호만
+ * 처리하므로(`process.once`) 두 번째 신호에 정리 없이 죽는다. 15초 안에 끝나지 않으면 그룹 전체를 SIGKILL한다.
+ */
 async function stop(child: ChildProcess): Promise<void> {
   if (child.exitCode !== null || child.signalCode !== null) return;
   const exited = new Promise<void>((resolve) => child.once('exit', () => resolve()));
   child.kill('SIGTERM');
-  const timer = setTimeout(() => child.kill('SIGKILL'), 15_000);
+  const timer = setTimeout(() => killGroups(child.pid === undefined ? [] : [child.pid]), 15_000);
   await exited;
   clearTimeout(timer);
 }
 
+function killGroups(pgids: readonly number[]): void {
+  for (const pgid of pgids) {
+    try {
+      process.kill(-pgid, 'SIGKILL');
+    } catch {
+      // 이미 없는 그룹이다.
+    }
+  }
+}
+
+/** 끈 자식의 프로세스 그룹에 아직 프로세스가 남았는지 `pgrep -g`로 본다. 남은 그룹 번호를 돌려준다. */
+async function survivors(list: readonly ChildProcess[]): Promise<number[]> {
+  const left: number[] = [];
+  for (const child of list) {
+    if (child.pid === undefined) continue;
+    try {
+      await promisify(execFile)('pgrep', ['-g', String(child.pid)]);
+      left.push(child.pid);
+    } catch {
+      // pgrep은 찾은 것이 없으면 1로 끝난다.
+    }
+  }
+  return left;
+}
+
+// 자식이 제 그룹에 있어 터미널 신호를 받지 않으므로, 러너가 받으면 자식을 끄고 끝낸다.
+for (const signal of ['SIGINT', 'SIGTERM'] as const) {
+  process.once(signal, () => {
+    say(`${signal}: 띄운 프로세스를 끄고 끝낸다`);
+    void Promise.all([...children].map((child) => stop(child))).finally(() => process.exit(130));
+  });
+}
+
+async function withTimeout(url: string, init: RequestInit = {}): Promise<Response> {
+  try {
+    return await fetch(url, { ...init, signal: AbortSignal.timeout(HTTP_TIMEOUT_MS) });
+  } catch (error) {
+    throw new Error(`${url}: ${HTTP_TIMEOUT_MS}ms 안에 응답이 없거나 연결 실패(${error instanceof Error ? error.message : String(error)})`);
+  }
+}
+
 async function getJson(url: string): Promise<unknown> {
-  const res = await fetch(url);
+  const res = await withTimeout(url);
   if (!res.ok) throw new Error(`${url}: ${res.status}`);
   return res.json();
 }
 
 async function postJson(url: string, body: unknown): Promise<unknown> {
-  const res = await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+  const res = await withTimeout(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
   if (!res.ok) throw new Error(`${url}: ${res.status} ${await res.text()}`);
   return res.json();
 }
@@ -483,6 +580,7 @@ async function getViaProxy(proxy: string, target: string): Promise<number> {
       res.resume();
       resolve(res.statusCode ?? 0);
     });
+    req.setTimeout(HTTP_TIMEOUT_MS, () => req.destroy(new Error(`${proxy} 경유 ${target}: ${HTTP_TIMEOUT_MS}ms 안에 응답이 없다`)));
     req.on('error', reject);
     req.end();
   });

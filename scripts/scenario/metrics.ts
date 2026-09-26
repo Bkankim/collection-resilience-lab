@@ -36,6 +36,24 @@ export function recoveryOf(failureTimes: readonly number[], terminals: readonly 
   return { kind: 'not-recovered', firstFailureAt };
 }
 
+/**
+ * 실패 응답 구간(첫 실패 응답부터 마지막 실패 응답까지). 회복 시간을 해석할 때 옆에 둔다.
+ *
+ * 이 설계에서는 작업이 실패로 끝나지 않으므로, 회복 시간은 사실상 "첫 실패 응답 뒤 작업 10건이 끝나는 데 걸린 시간"이고
+ * 10/처리량(`secondsForStreak`)과 거의 같다. 실패가 멈춘 시점은 재지 않는다. 실패가 언제까지 이어졌는지는 이 구간이 보인다.
+ */
+export function failureWindow(failureTimes: readonly number[]): { first: number; last: number; ms: number } | null {
+  if (failureTimes.length === 0) return null;
+  const first = Math.min(...failureTimes);
+  const last = Math.max(...failureTimes);
+  return { first, last, ms: last - first };
+}
+
+/** 처리량으로 계산한, 작업 `streak`건을 끝내는 데 걸리는 시간(초). 처리량이 0이면 null. */
+export function secondsForStreak(throughput: number, streak: number = RECOVERY_STREAK): number | null {
+  return throughput <= 0 ? null : streak / throughput;
+}
+
 export function throughputOf(completed: number, startedAt: number, endedAt: number): number {
   const seconds = (endedAt - startedAt) / 1000;
   return seconds <= 0 ? 0 : completed / seconds;

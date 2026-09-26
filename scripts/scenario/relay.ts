@@ -39,6 +39,8 @@ export type RelayOptions = {
   /** 이 중계가 넘기는 출발지 프록시. 예 `http://127.0.0.1:3128`. */
   upstream: string;
   delayMs: number;
+  /** upstream 요청 하나의 제한 시간. 넘기면 502(`relayError: 'UPSTREAM_TIMEOUT'`)로 끝낸다. 기본 20초. */
+  upstreamTimeoutMs?: number;
   onRecord: (record: RelayRecord) => void;
   clock?: () => number;
 };
@@ -77,10 +79,23 @@ export async function startRelay(options: RelayOptions): Promise<Relay> {
             retryAfter: typeof retryAfter === 'string' ? retryAfter : null,
           });
           res.writeHead(upstreamRes.statusCode ?? 502, upstreamRes.headers);
+          // 본문 도중에 upstream이 끊기면 pipe는 res를 끝내지 않는다. 워커가 제 시간 초과까지 멈추지 않게 응답을 끊는다.
+          upstreamRes.on('aborted', () => res.destroy());
+          upstreamRes.on('error', () => res.destroy());
           upstreamRes.pipe(res);
         },
       );
+      outgoing.setTimeout(options.upstreamTimeoutMs ?? 20_000, () => {
+        const error: NodeJS.ErrnoException = new Error('upstream 응답 제한 시간 초과');
+        error.code = 'UPSTREAM_TIMEOUT';
+        outgoing.destroy(error);
+      });
       outgoing.on('error', (error) => {
+        // 응답 머리를 이미 보냈으면 그 상태가 기록돼 있다. 두 번째 상태(502)를 기록하지 않고 응답을 끊는다.
+        if (res.headersSent) {
+          res.destroy();
+          return;
+        }
         // upstream이 죽으면 502. 워커는 이것을 TRANSIENT로 본다. 조용히 삼키지 않고 기록도 남긴다.
         options.onRecord({
           t: new Date(clock()).toISOString(),
@@ -93,7 +108,7 @@ export async function startRelay(options: RelayOptions): Promise<Relay> {
           retryAfter: null,
           relayError: (error as NodeJS.ErrnoException).code ?? error.message,
         });
-        if (!res.headersSent) res.writeHead(502);
+        res.writeHead(502);
         res.end(error.message);
       });
       req.pipe(outgoing);
