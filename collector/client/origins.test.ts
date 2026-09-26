@@ -10,7 +10,7 @@ import http from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { afterEach, describe, expect, it } from 'vitest';
 
-import { OriginPool, createProxyOrigins, parseProxyList } from './origins.js';
+import { OriginPool, createProxyOrigins, parseProxyList, resolveTargetOrigin } from './origins.js';
 import type { Origin } from './origins.js';
 
 const noop: Origin['transport'] = async () => ({ network: { message: 'unused' } });
@@ -55,11 +55,11 @@ describe('출발지 풀', () => {
     ]);
   });
 
-  it('더 짧은 차단이 와도 이미 걸린 해제 시각을 줄이지 않는다', () => {
+  it('더 짧은 차단이 와도 이미 걸린 해제 시각을 줄이지 않고, 실제로 남은 해제 시각을 돌려준다', () => {
     const now = { t: 1_000 };
     const { origins, pool: p } = pool(['a', 'b'], now);
-    p.block(origins[0] as Origin, 9_000);
-    p.block(origins[0] as Origin, 2_000);
+    expect(p.block(origins[0] as Origin, 9_000)).toBe(9_000);
+    expect(p.block(origins[0] as Origin, 2_000)).toBe(9_000);
     now.t = 5_000;
     expect(p.available()).toBe(origins[1]);
   });
@@ -97,6 +97,48 @@ describe('WORKER_PROXIES 읽기', () => {
     expect(() => parseProxyList('socks5://127.0.0.1:1080')).toThrow(RangeError);
     expect(() => parseProxyList('http://u:p@127.0.0.1:3128')).toThrow(RangeError);
     expect(() => parseProxyList('http://127.0.0.1:3128,http://127.0.0.1:3128')).toThrow(RangeError);
+  });
+
+  it('오류 메시지에 원문의 어느 조각도 싣지 않고 몇 번째 항목인지만 싣는다(자격증명이 로그에 남지 않게)', () => {
+    const cases: [string, string[]][] = [
+      ['http://127.0.0.1:3128,socks5://user:s3cret@host.example:1080', ['user', 's3cret', 'host.example', 'socks5']],
+      ['http://127.0.0.1:3128,TOKEN0123:@proxy.example:3128', ['TOKEN0123', 'proxy.example']],
+      ['http://127.0.0.1:3128,user:s3cret@proxy.example:3128', ['user', 's3cret', 'proxy.example']],
+      ['http://127.0.0.1:3128,http://user:s3cret@proxy.example:3128', ['user', 's3cret', 'proxy.example']],
+      ['http://127.0.0.1:3128,not a url s3cret', ['s3cret', 'not a url']],
+    ];
+    for (const [raw, fragments] of cases) {
+      let message = '';
+      try {
+        parseProxyList(raw);
+      } catch (error) {
+        message = (error as Error).message;
+      }
+      expect(message).toContain('2번째');
+      for (const fragment of fragments) expect(message).not.toContain(fragment);
+    }
+    let dup = '';
+    try {
+      parseProxyList('http://127.0.0.1:3128,http://127.0.0.1:3128');
+    } catch (error) {
+      dup = (error as Error).message;
+    }
+    expect(dup).toContain('1번째');
+    expect(dup).not.toContain('127.0.0.1');
+  });
+});
+
+describe('TARGET_ORIGIN 읽기', () => {
+  it('프록시가 없으면 비어도 기본값(호스트의 대상 서버)이다', () => {
+    expect(resolveTargetOrigin(undefined, [])).toBe('http://127.0.0.1:8080');
+    expect(resolveTargetOrigin('  ', [])).toBe('http://127.0.0.1:8080');
+    expect(resolveTargetOrigin('http://127.0.0.1:8081', [])).toBe('http://127.0.0.1:8081');
+  });
+
+  it('프록시가 있는데 TARGET_ORIGIN이 없으면 던진다. 기본값은 프록시 안에서 프록시 자신이다', () => {
+    expect(() => resolveTargetOrigin(undefined, ['http://127.0.0.1:3128'])).toThrow(RangeError);
+    expect(() => resolveTargetOrigin(' ', ['http://127.0.0.1:3128'])).toThrow(RangeError);
+    expect(resolveTargetOrigin('http://target:8080', ['http://127.0.0.1:3128'])).toBe('http://target:8080');
   });
 });
 

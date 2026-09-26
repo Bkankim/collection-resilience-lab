@@ -12,6 +12,7 @@ CI에서 검증합니다. 다만 그 테스트 안에서는 출발지가 전부 
 | 3 | 이 브랜치 | 전환 전후 출발지 주소, 모두 막혔을 때 가장 빠른 해제까지 정지, 결과 행 수 = 원장 |
 | 4 | 이 브랜치 | 창이 두 워커의 로그인 비용과 같으면(N=4) 모두 막힌 채 NO_PROGRESS로만 DLQ |
 | 5 | 이 브랜치 | 출발지별 성공·실패 수 로그, 테스트와 대조 실행 |
+| 6 | final-review 반영 뒤 | 리뷰 결함 수정, keep-alive 확인, 3절 조건 재실측 |
 
 ## 실행 조건
 
@@ -431,6 +432,180 @@ B로 바꿨습니다. 대상 서버는 차단 중인 출발지의 요청을 M �
 대조 실행(고치려는 것을 빼고 실패하는지, TROUBLESHOOTING 5번): 전환을 끄면 첫째·셋째·넷째가, 429에도 전환하면 둘째가,
 "모두 막힘"의 정지를 가장 빠른 해제 대신 그 작업의 Retry-After로 걸면 넷째가 실패했습니다. 되돌리면 통과합니다.
 
+## 6. final-review 반영 뒤: 차단기 재확인, 큐 정지 중 전환 보류, 모두 막힌 채 시작하지 않기
+
+final-review(수정 전 diff 기준 버그 리뷰)의 판정대로 고쳤습니다. 항목마다 먼저 테스트를 쓰고, 고치기 전 코드에서 그 테스트가
+실패하는 것을 본 뒤에 고쳤습니다(새 테스트 8개가 고치기 전 코드에서 8개 모두 실패, 고친 뒤 통과).
+
+| 항목 | 무엇이 틀렸나 | 고친 것 |
+|---|---|---|
+| #1 | `WORKER_PROXIES` 오류 메시지가 원문(자격증명 포함)을 실었다. 스킴 검사가 자격증명 검사보다 앞이라 `socks5://user:pass@host`가 원문째 로그에 남았다 | 메시지에 몇 번째 항목인지와 이유만 싣는다. 스킴·호스트 조각도 싣지 않는다(`TOKEN:@host`처럼 스킴 자리에 비밀이 오는 값) |
+| #2 | `origin-rotated`의 `blockedUntil`이 풀이 든 값이 아니라 이번 Retry-After 기준이었다 | `OriginPool.block`이 실제 해제 시각을 돌려주고 로그는 그 값을 싣는다 |
+| #3 | 자격증명 차단기를 처리 시작에서 한 번만 봤다. 전환하면 로그인을 다시 보내므로, 그사이 같은 로그인 ID의 다른 작업이 AUTH_FAILED로 차단기를 걸어도 틀린 비밀번호가 한 번 더 나갔다 | 전환해 다시 수집하기 직전마다 차단기를 본다. 걸려 있으면 로그인하지 않고 차단기 처분(DLQ)으로 간다 |
+| #5 | 처리 안의 전환은 BullMQ로 돌아가지 않아, 다른 워커의 429가 건 큐 정지 중에도 새 출발지로 로그인·페이지가 나갔다. 속도 제한을 출발지 전환으로 비켜 가는 셈이다 | 전환 직전에 `queue.getRateLimitTtl(Number.MAX_SAFE_INTEGER)`로 큐 정지가 남았는지 본다. 남았으면 바꾸지 않고(`origin-rotation-held`) 그 남은 시간만큼 큐 정지 경로로 간다 |
+| #6 | 모두 막혔다고 아는데도 `pick()`이 아직 막힌 출발지를 돌려줘 확정적인 403을 한 번 더 보냈다(concurrency 2 이상, 다른 워커의 짧은 정지가 앞선 정지를 덮어쓴 경우) | 처리를 시작할 때 풀의 출발지가 모두 막혀 있으면 로그인을 보내지 않고 가장 빠른 해제까지 큐를 멈춘다(`origins-exhausted`) |
+| #9 | `WORKER_PROXIES`를 주고 `TARGET_ORIGIN`을 빠뜨리면 기본값 127.0.0.1:8080이 되고, 그것은 프록시 컨테이너 안에서 프록시 자신이라 전부 5xx였다 | 워커를 시작할 때 던진다(`resolveTargetOrigin`) |
+
+`getRateLimitTtl`에 `Number.MAX_SAFE_INTEGER`를 넘기는 이유: `queue.rateLimit`은 limiter 키를 그 값으로 두고(bullmq 6.3.8
+`setRateLimit`), 워커 limiter는 같은 키로 평소 꺼낸 작업 수를 셉니다. `getRateLimitTtl` 스크립트는 키 값이 넘긴 값 이상일 때만
+남은 시간을 주므로, 이 값으로 물으면 평소 세기(초당 100개 미만)는 0이고 속도 제한 정지만 남은 시간이 나옵니다.
+
+`TARGET_ORIGIN` 없이 띄운 워커:
+
+```sh
+$ QUEUE_NAME=d3origin3 WORKER_PROXIES=http://127.0.0.1:3128,http://127.0.0.1:3129 tsx collector/worker/index.ts
+  if (proxies.length > 0) throw new RangeError('WORKER_PROXIES를 주면 TARGET_ORIGIN도 줘야 한다(프록시가 보는 대상 서버 주소, compose면 http://target:8080)');
+(exit 1)
+```
+
+### 6-1. keep-alive (#7): 확정되지 않아 고치지 않았다
+
+리뷰는 ProxyAgent가 기본 keep-alive이고 tinyproxy가 응답마다 클라이언트 연결을 닫으므로 닫힌 소켓을 재사용해 네트워크 오류가
+날 수 있다고 봤습니다(#15 측정의 중계가 keep-alive로 502를 낸 선례). 확인한 것:
+
+```sh
+$ curl -s -i -x http://127.0.0.1:3128 http://target:8080/health
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+content-length: 11
+Date: Sat, 26 Sep 2026 20:06:14 GMT
+$ curl -sv -x http://127.0.0.1:3128 http://target:8080/health http://target:8080/health 2>&1 | grep -iE 'connected to|left intact|closing'
+* Connected to 127.0.0.1 (127.0.0.1) port 3128
+* Connection #0 to host 127.0.0.1 left intact
+* Closing connection
+* Connected to 127.0.0.1 (127.0.0.1) port 3128
+* Connection #1 to host 127.0.0.1 left intact
+$ tsx burst.mts 200     # ProxyAgent 하나로 /health와 세션 없는 /transactions를 번갈아 await하며 연속 요청
+{"requests":200,"results":{"status:200":100,"status:401":100}}
+tinyproxy: client_connects=202 requests=202 upstream=202 closed=202     # curl 2 + burst 200
+$ tsx burst.mts 500 (두 번)
+{"requests":500,"results":{"status:200":250,"status:401":250}}
+{"requests":500,"results":{"status:200":250,"status:401":250}}
+```
+
+tinyproxy는 `Connection: close` 헤더 없이 HTTP/1.1로 답하고 응답마다 클라이언트 연결을 닫습니다(연결 수 = 요청 수). 그런데
+undici는 다음 요청 전에 닫힌 것을 알아채고 새 연결을 열어, 연속 1200요청에서 네트워크 오류가 0건이었습니다. #15의 502는
+그 러너의 앞단 중계가 닫힌 연결을 재사용한 것이고 이 경로에는 그 중계가 없습니다. 확정되지 않아 keep-alive를 끄지 않았습니다.
+응답과 닫힘 사이에 다음 요청이 끼어드는 경쟁은 있을 수 있고, 그때는 TRANSIENT로 재시도합니다.
+
+### 6-2. 3절 조건 재실측 (큐 `d3origin3`)
+
+3절과 같은 조건(compose 대상 서버 재시작, 워커 2개, W=2초 N=8 M=2 T=10초, demo01 4건)입니다.
+
+```
+elapsed 23s
+{"id":"col_55791c502578c0f4189d5673eea749ae","state":"completed","attemptsMade":1,"results":137,"ledger":137,"match":true}
+{"id":"col_fe99bf7049c4171bb4a0210ea1b2a012","state":"completed","attemptsMade":1,"results":137,"ledger":137,"match":true}
+{"id":"col_d92aa799027219910430374909f4c7e8","state":"completed","attemptsMade":1,"results":133,"ledger":133,"match":true}
+{"id":"col_a0f4623b3dc526686dda8319afcadfe8","state":"completed","attemptsMade":1,"results":129,"ledger":129,"match":true}
+dead: 0 progress: pages 32 seen 24 cycles 0
+```
+
+**4건 모두 완료, 결과 행 수 = 원장, DLQ 0.** 전체 요청(첫 요청 기준 ms, 이번에는 VM 시계가 물러나지 않았습니다):
+
+```
+첫 요청 2026-09-26T20:06:56.638Z
+      0 172.28.14.11    /login            200
+      1 172.28.14.11    /login            200
+      8 172.28.14.11    /auth/otp         200
+     10 172.28.14.11    /auth/otp         200
+     38 172.28.14.11    /transactions   1 200
+     38 172.28.14.11    /transactions   1 200
+     50 172.28.14.11    /transactions   2 200
+     50 172.28.14.11    /transactions   2 200
+     55 172.28.14.11    /transactions   3 429
+     55 172.28.14.11    /transactions   3 403
+     63 172.28.14.12    /login            200
+     65 172.28.14.12    /auth/otp         200
+     67 172.28.14.12    /transactions   3 200
+     71 172.28.14.12    /transactions   4 200
+     75 172.28.14.12    /transactions   5 200
+     78 172.28.14.12    /transactions   6 200
+     81 172.28.14.12    /transactions   7 200
+     85 172.28.14.12    /transactions   8 200
+   2085 172.28.14.11    /login            403
+   2087 172.28.14.12    /login            200
+   2094 172.28.14.12    /auth/otp         200
+   2095 172.28.14.12    /login            200
+   2098 172.28.14.12    /transactions   3 200
+   2100 172.28.14.12    /auth/otp         200
+   2103 172.28.14.12    /transactions   1 200
+   2106 172.28.14.12    /transactions   4 200
+   2109 172.28.14.12    /transactions   2 200
+   2110 172.28.14.12    /transactions   5 429
+   2113 172.28.14.12    /transactions   3 403
+  10119 172.28.14.11    /login            200
+  10128 172.28.14.11    /auth/otp         200
+  10133 172.28.14.11    /transactions   3 200
+  10134 172.28.14.11    /login            200
+  10139 172.28.14.11    /auth/otp         200
+  10141 172.28.14.11    /transactions   4 200
+  10143 172.28.14.11    /transactions   5 200
+  10148 172.28.14.11    /transactions   5 200
+  10149 172.28.14.11    /transactions   6 429
+  10153 172.28.14.11    /transactions   6 403
+  12165 172.28.14.12    /login            200
+  12165 172.28.14.11    /login            403
+  12171 172.28.14.12    /auth/otp         200
+  12172 172.28.14.12    /login            200
+  12174 172.28.14.12    /transactions   6 200
+  12176 172.28.14.12    /auth/otp         200
+  12179 172.28.14.12    /transactions   6 200
+  12182 172.28.14.12    /transactions   7 200
+  12186 172.28.14.12    /transactions   7 200
+  12187 172.28.14.12    /transactions   8 429
+  12192 172.28.14.12    /transactions   8 403
+  20178 172.28.14.11    /login            200
+  20184 172.28.14.11    /auth/otp         200
+  20188 172.28.14.11    /transactions   8 200
+  20197 172.28.14.11    /login            200
+  20200 172.28.14.11    /auth/otp         200
+  20201 172.28.14.11    /transactions   8 200
+  20206 172.28.14.11    /login            200
+  20208 172.28.14.11    /auth/otp         200
+  20209 172.28.14.11    /transactions   1 429
+  22231 172.28.14.11    /login            200
+  22235 172.28.14.11    /auth/otp         200
+  22237 172.28.14.11    /transactions   1 200
+  22242 172.28.14.11    /transactions   2 200
+  22246 172.28.14.11    /transactions   3 200
+  22252 172.28.14.11    /transactions   4 200
+  22256 172.28.14.11    /transactions   5 200
+  22259 172.28.14.11    /transactions   6 200
+  22262 172.28.14.11    /transactions   7 403
+  22264 172.28.14.12    /login            200
+  22266 172.28.14.12    /auth/otp         200
+  22268 172.28.14.12    /transactions   7 200
+  22270 172.28.14.12    /transactions   8 200
+```
+
+- 전환: 55ms에 172.28.14.11에서 403, 63ms에 172.28.14.12로 로그인부터 다시(w2), 85ms에 그 작업 완료.
+- 모두 막힘: 2113ms(B 403) 뒤 10119ms까지 요청 0건, A로 재개. 12192ms(B 403) 뒤 20178ms까지 0건, A로 재개.
+- **큐 정지 중 전환 보류(#5, 새 동작)**: 10149ms에 w1이 A에서 429를 받아 큐를 2초 멈추고, 4ms 뒤(10153ms) w2가 A에서 403을 받았습니다.
+  고치기 전이라면 w2는 곧바로 B로 로그인했을 자리입니다. 이번에는 바꾸지 않고 남은 정지(1996ms)만큼 멈췄고, 다음 요청은 12165ms입니다.
+
+```
+{"t":"2026-09-26T20:07:06.679Z","worker":"w1","pid":16185,"event":"origin-result","jobId":"col_55791c502578c0f4189d5673eea749ae","origin":"http://127.0.0.1:3128","outcome":"RATE_LIMITED","ok":0,"failed":3}
+{"t":"2026-09-26T20:07:06.679Z","worker":"w1","pid":16185,"event":"rate-limited","jobId":"col_55791c502578c0f4189d5673eea749ae","attemptsMade":0,"kind":"RATE_LIMITED","waitMs":2000,"detail":"HTTP 429"}
+{"t":"2026-09-26T20:07:06.683Z","worker":"w2","pid":16184,"event":"origin-result","jobId":"col_d92aa799027219910430374909f4c7e8","origin":"http://127.0.0.1:3128","outcome":"IP_BLOCKED","ok":0,"failed":2}
+{"t":"2026-09-26T20:07:06.684Z","worker":"w2","pid":16184,"event":"origin-rotation-held","jobId":"col_d92aa799027219910430374909f4c7e8","from":"http://127.0.0.1:3128","to":"http://127.0.0.1:3129","waitMs":1996}
+{"t":"2026-09-26T20:07:06.684Z","worker":"w2","pid":16184,"event":"rate-limited","jobId":"col_d92aa799027219910430374909f4c7e8","attemptsMade":0,"kind":"IP_BLOCKED","waitMs":1996,"detail":"HTTP 403 + Retry-After, 본문 IP_BLOCKED"}
+```
+
+대상 서버 원문(`level`·`pid`·`hostname`·`responseTime` 뺌)도 같습니다. 403(req-14) 뒤 2011ms 동안 요청이 없고, 다음은 B의 로그인입니다.
+
+```
+{"time": 1790453226787, "reqId": "req-13", "req": {"method": "GET", "url": "/transactions?account=000-11-222333&page=6", "host": "target:8080", "remoteAddress": "172.28.14.11", "remotePort": 39218}, "msg": "incoming request"}
+{"time": 1790453226787, "reqId": "req-13", "res": {"statusCode": 429}, "msg": "request completed"}
+{"time": 1790453226791, "reqId": "req-14", "req": {"method": "GET", "url": "/transactions?account=000-11-222333&page=6", "host": "target:8080", "remoteAddress": "172.28.14.11", "remotePort": 39230}, "msg": "incoming request"}
+{"time": 1790453226791, "reqId": "req-14", "res": {"statusCode": 403}, "msg": "request completed"}
+{"time": 1790453228802, "reqId": "req-15", "req": {"method": "POST", "url": "/login", "host": "target:8080", "remoteAddress": "172.28.14.12", "remotePort": 55844}, "msg": "incoming request"}
+{"time": 1790453228803, "reqId": "req-15", "res": {"statusCode": 200}, "msg": "request completed"}
+```
+
+이번 실행에서는 "처리를 시작할 때 모두 막혀 있음"(#6)과 "전환 직전 차단기"(#3)가 일어나지 않았습니다(concurrency 1, 자격증명
+정상). 두 경로는 워커 테스트만 봅니다.
+
 ## 안 한 것
 
 - 워커끼리 차단 상태를 나누지 않았습니다(Redis 공유 없음). 3절 2080ms처럼 워커마다 한 번씩 막힌 출발지로 보냅니다.
@@ -439,6 +614,13 @@ B로 바꿨습니다. 대상 서버는 차단 중인 출발지의 요청을 M �
   있지만, 그것은 속도 제한을 출발지 수만큼 늘려 받는 것이라 이슈 범위(429에서 바꾸지 않는다)와 같은 이유로 하지 않았습니다.
 - 프록시 컨테이너가 죽은 경우(연결 거부)는 TRANSIENT로 분류되어 지금처럼 재시도합니다. 출발지를 바꾸지 않습니다. 실측하지 않았습니다.
 - 대상 서버 이미지(`target/Dockerfile`)는 로컬 compose에서만 빌드했습니다. CI에 이미지 빌드를 넣지 않았습니다.
+- **전환 상한과 목록 순서 때문에 생기는 거짓 "모두 막힘"(final-review #4, 한계로 둠).** 한 처리의 전환은 출발지 수 - 1번까지이고
+  다음 출발지는 목록 순서로 고릅니다. 출발지 2개에서 A가 짧게 막혀 B로 바꾼 뒤, B의 로그인 도중 A가 풀렸는데 B도 403이면 A가
+  비었는데도 "모두 막힘"으로 가서 1ms 정지하고 무진행 주기 하나를 셉니다. 출발지 3개면 풀린 A를 다시 골라 C를 써 보지 못한 채
+  상한에 닿습니다. 영향은 1ms 정지와 무진행 1주기입니다. 고치려면 전환 예산 규칙(써 본 출발지 집합, 풀린 출발지의 재사용)을 다시
+  짜야 해서 이번에는 두었습니다. 확정 방법: B의 수집 안에서 A의 해제 시각을 넘기는 가짜 시계 테스트로 `origins-exhausted`에
+  풀린 출발지가 있고 `waitMs` 1, 출발지 3개에서 C가 수집에 오지 않는 것을 봅니다.
+- final-review #8(Retry-After 0이면 같은 출발지로 A에서 A로 전환)은 기각했습니다. 대상 서버는 Retry-After를 최소 1초로 줍니다(`target/switches.ts` `secondsUntil`).
 
 ## 부록: 스크립트
 
@@ -556,4 +738,24 @@ via = tb;
 const page = await session.fetchPage('000-44-555666', 1);
 console.log('page 1 via B:', page.ok ? `ok ${page.page.rows.length} rows` : page.kind, 'stats', JSON.stringify(session.stats));
 await Promise.all([a.close(), b.close()]);
+```
+
+### burst.mts
+
+```ts
+// #7: ProxyAgent 하나로 연속 요청을 N번 보내 네트워크 오류가 나는지 본다.
+import { ProxyAgent } from 'undici';
+import { createUndiciTransport } from '<리포>/collector/client/transport.ts';
+const n = Number(process.argv[2] ?? 60);
+const agent = new ProxyAgent('http://127.0.0.1:3128');
+const t = createUndiciTransport({ origin: 'http://target:8080', dispatcher: agent });
+const out: Record<string, number> = {};
+for (let i = 0; i < n; i++) {
+  const path = i % 2 === 0 ? '/health' : '/transactions?account=000-44-555666&page=1';
+  const res = await t({ method: 'GET', path });
+  const key = 'network' in res ? `network:${res.network.code ?? res.network.name}` : `status:${res.status}`;
+  out[key] = (out[key] ?? 0) + 1;
+}
+console.log(JSON.stringify({ requests: n, results: out }));
+await agent.close();
 ```

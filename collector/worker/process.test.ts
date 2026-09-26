@@ -1436,4 +1436,114 @@ suite('큐 워커: 출발지 전환(#14)', () => {
     expect(lab.events.filter((e) => e.event.startsWith('origin'))).toEqual([]);
     expect(lab.events.filter((e) => e.event === 'rate-limited')).toMatchObject([{ kind: 'IP_BLOCKED', attemptsMade: 0, waitMs: 300 }]);
   });
+
+  /** 출발지 이름만 있고 요청은 보내지 않는 출발지. 가짜 수집 함수와 같이 쓴다. */
+  function namedOrigins(...names: string[]): Origin[] {
+    return names.map((name) => ({ name, transport: (async () => ({ network: { message: 'unused' } })) as Transport }));
+  }
+  const blockedFor = (sec: number): CollectResult => ({ ok: false, kind: 'IP_BLOCKED', detail: 'HTTP 403 + Retry-After', retryAfterSec: sec });
+
+  it('origin-rotated 로그의 blockedUntil은 풀이 실제로 든 해제 시각이다(다른 작업이 더 길게 막아 둔 경우)', { timeout: TIMEOUT }, async () => {
+    const lab = await makeLab();
+    const origins = namedOrigins('A', 'B');
+    const pool = new OriginPool(origins, systemClock);
+    let longUntil = 0;
+    await lab.startWorker(
+      'w1',
+      async (_data, _options, egress) => {
+        if (egress?.name === 'A') {
+          // 같은 프로세스의 다른 작업이 A를 30초 막아 둔 뒤, 이 작업은 1초짜리 차단을 받는다.
+          longUntil = Date.now() + 30_000;
+          pool.block(origins[0] as Origin, longUntil);
+          return blockedFor(1);
+        }
+        return { ok: true, rows: [], pages: 1 };
+      },
+      { origins: pool },
+    );
+    const id = await lab.add(DEMO02, ALL.from, ALL.to);
+    expect(await lab.waitFinished([id])).toEqual({ [id]: 'completed' });
+    const rotated = lab.events.find((e) => e.event === 'origin-rotated');
+    expect(rotated?.event === 'origin-rotated' && Date.parse(rotated.blockedUntil)).toBe(longUntil);
+  });
+
+  it('전환해서 다시 수집하기 전에 자격증명 차단기를 다시 본다. 그사이 차단됐으면 다른 출발지로 로그인하지 않는다', { timeout: TIMEOUT }, async () => {
+    const lab = await makeLab();
+    const used: string[] = [];
+    await lab.startWorker(
+      'w1',
+      async (data, _options, egress) => {
+        used.push(egress?.name ?? '-');
+        // A 시도가 도는 동안 같은 로그인 ID의 다른 작업이 AUTH_FAILED로 차단기를 걸었다.
+        await lab.redis.set(authBlockKey(lab.queue.name, data.loginId), JSON.stringify({ jobId: 'other', kind: 'AUTH_FAILED', detail: 'HTTP 401', at: new Date().toISOString() }));
+        return blockedFor(5);
+      },
+      { origins: new OriginPool(namedOrigins('A', 'B'), systemClock) },
+    );
+    const id = await lab.add(DEMO02, ALL.from, ALL.to);
+    expect(await lab.waitFinished([id])).toEqual({ [id]: 'failed' });
+
+    expect(used).toEqual(['A']);
+    expect(lab.events.filter((e) => e.event === 'origin-rotated')).toEqual([]);
+    expect(lab.events.filter((e) => e.event === 'auth-blocked')).toHaveLength(1);
+    expect((await lab.deadLetter.getJob(id))?.data).toMatchObject({ kind: 'AUTH_FAILED' });
+  });
+
+  it('다른 워커의 속도 제한으로 큐가 멈춰 있으면 전환하지 않고 남은 정지만큼 큐 정지 경로로 간다', { timeout: TIMEOUT }, async () => {
+    const lab = await makeLab();
+    const calls: { origin: string; t: number }[] = [];
+    await lab.startWorker(
+      'w1',
+      async (_data, _options, egress) => {
+        calls.push({ origin: egress?.name ?? '-', t: Date.now() });
+        if (egress?.name === 'A') {
+          // A가 도는 동안 다른 워커가 429를 받아 큐를 1.5초 멈췄다.
+          await lab.queue.rateLimit(1_500);
+          return blockedFor(10);
+        }
+        return { ok: true, rows: [], pages: 1 };
+      },
+      { origins: new OriginPool(namedOrigins('A', 'B'), systemClock) },
+    );
+    const id = await lab.add(DEMO02, ALL.from, ALL.to);
+    expect(await lab.waitFinished([id])).toEqual({ [id]: 'completed' });
+
+    expect(calls.map((c) => c.origin)).toEqual(['A', 'B']);
+    // B로는 큐 정지가 끝난 뒤에야 나갔다.
+    expect((calls[1]?.t as number) - (calls[0]?.t as number)).toBeGreaterThanOrEqual(1_400);
+    expect(lab.events.filter((e) => e.event === 'origin-rotated')).toEqual([]);
+    const held = lab.events.filter((e) => e.event === 'origin-rotation-held');
+    expect(held).toHaveLength(1);
+    const limited = lab.events.filter((e) => e.event === 'rate-limited');
+    expect(limited).toHaveLength(1);
+    expect(limited[0]).toMatchObject({ kind: 'IP_BLOCKED', attemptsMade: 0 });
+    expect(limited[0]?.event === 'rate-limited' && limited[0].waitMs).toBeLessThanOrEqual(1_500);
+  });
+
+  it('처리를 시작할 때 출발지가 모두 막혀 있으면 로그인을 보내지 않고 가장 빠른 해제까지 큐를 멈춘다', { timeout: TIMEOUT }, async () => {
+    const lab = await makeLab();
+    const origins = namedOrigins('A', 'B');
+    const pool = new OriginPool(origins, systemClock);
+    const calls: { origin: string; t: number }[] = [];
+    await lab.startWorker(
+      'w1',
+      async (_data, _options, egress) => {
+        calls.push({ origin: egress?.name ?? '-', t: Date.now() });
+        return { ok: true, rows: [], pages: 1 };
+      },
+      { origins: pool },
+    );
+    const started = Date.now();
+    pool.block(origins[0] as Origin, started + 1_500);
+    pool.block(origins[1] as Origin, started + 3_000);
+    const id = await lab.add(DEMO02, ALL.from, ALL.to);
+    expect(await lab.waitFinished([id])).toEqual({ [id]: 'completed' });
+
+    // 막힌 출발지로는 한 번도 보내지 않았고, A가 풀린 뒤 A로 한 번 보냈다.
+    expect(calls.map((c) => c.origin)).toEqual(['A']);
+    expect((calls[0]?.t as number) - started).toBeGreaterThanOrEqual(1_400);
+    expect(lab.events.filter((e) => e.event === 'origins-exhausted')).toHaveLength(1);
+    expect(lab.events.filter((e) => e.event === 'rate-limited')).toMatchObject([{ kind: 'IP_BLOCKED', attemptsMade: 0 }]);
+    expect(lab.events.filter((e) => e.event === 'origin-result')).toMatchObject([{ origin: 'A', outcome: 'ok' }]);
+  });
 });
