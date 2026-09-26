@@ -1,0 +1,4 @@
+# 빌드 문맥이 리포 루트라 호스트의 node_modules(다른 플랫폼 바이너리)가 실리지 않게 한다.
+node_modules
+.git
+.fablize

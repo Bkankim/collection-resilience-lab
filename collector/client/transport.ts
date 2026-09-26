@@ -4,7 +4,8 @@
  * 따로 둔 이유는 두 가지다.
  *
  * 1. **출발지 교체(#14).** undici는 연결 풀을 dispatcher 단위로 들고 있어서, 출발지를
- *    바꾸려면 dispatcher(ProxyAgent)를 바꿔 끼워야 한다. 그 자리를 여기 하나로 모았다.
+ *    바꾸려면 dispatcher(ProxyAgent)를 바꿔 끼워야 한다. 출발지마다 dispatcher를 쥔 전송을
+ *    따로 만들고(`origins.ts`), 전송은 만든 뒤 dispatcher를 바꾸지 않는다.
  * 2. **예외 대신 값.** 네트워크 오류를 던지지 않고 `NetworkFailure`로 돌려준다. 호출하는
  *    쪽이 try/catch를 빠뜨리면 분류기를 거치지 않은 예외가 워커를 죽이고, 그 실패는
  *    어느 종류로도 세지지 않는다.
@@ -34,7 +35,10 @@ export type Transport = (req: HttpRequest) => Promise<ClassifyInput>;
 export type UndiciTransportOptions = {
   /** 예: `http://127.0.0.1:8081` */
   origin: string;
-  /** #14에서 출발지별 ProxyAgent를 넣는 자리. 없으면 undici 전역 dispatcher. */
+  /**
+   * 출발지별 ProxyAgent(#14, `origins.ts`). 없으면 undici 전역 dispatcher이고, 그때는 요청마다 **그 시점의**
+   * 전역을 쓴다(d3-origin.md 2절 H2).
+   */
   dispatcher?: Dispatcher;
   /**
    * 헤더가 올 때까지 기다리는 시간(ms). undici 기본값은 300초다. 응답하지 않는 서버에
