@@ -28,6 +28,6 @@
     "iconv-lite": "^0.7.3",
     "ioredis": "5.11.1",
     "otplib": "^13.5.0",
-    "undici": "8.10.2"
+    "undici": "8.11.2"
   }
 }
