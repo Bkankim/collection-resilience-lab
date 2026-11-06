@@ -167,6 +167,6 @@
 
 - **원인**: bind mount의 원본 경로는 Docker 데몬이 사는 VM 안에서 찾는다. 공유되지 않은 경로(홈 밖의 임시 디렉터리)의 파일은 VM에 없고, Docker는 없는 원본 자리에 빈 디렉터리를 만들어 붙인다. 디렉터리를 파일 자리(`/etc/tinyproxy/tinyproxy.conf`)에 붙이려다 `not a directory`로 실패한다. 설정을 호스트 파일 마운트에 기댔기 때문에 clone 위치에 따라 동작이 갈렸다.
 
-- **수정**: `docker/tinyproxy/Dockerfile`에서 `COPY tinyproxy.conf /etc/tinyproxy/tinyproxy.conf`로 설정을 이미지에 넣고, compose의 proxy-a·proxy-b `volumes` 줄을 지웠다(build context가 `docker/tinyproxy`라 COPY가 된다). 이미지만 따로 빌드해 컨테이너 안의 설정이 일반 파일인 것을 확인했다. 새 clone에서 compose를 다시 띄워 보는 확인은 아직 하지 않았다.
+- **수정**: `docker/tinyproxy/Dockerfile`에서 `COPY tinyproxy.conf /etc/tinyproxy/tinyproxy.conf`로 설정을 이미지에 넣고, compose의 proxy-a·proxy-b `volumes` 줄을 지웠다(build context가 `docker/tinyproxy`라 COPY가 된다). 이미지만 따로 빌드해 컨테이너 안의 설정이 일반 파일인 것을 확인했다. 이후 새 clone에서 README 세 줄을 다시 따라 했다. `~/workspace` 아래와 `/private/tmp` 아래(이 리포 이미지를 지운 상태) 모두 exit 0, 네 시나리오 모두 200/200·DLQ 0이었다(24836ba, PR #22).
 
 - **남는 것**: 설정을 바꾸면 이미지를 다시 빌드해야 한다(`docker compose up -d --build`). 다른 서비스에 호스트 경로 mount를 새로 넣으면 같은 문제가 다시 생긴다.
